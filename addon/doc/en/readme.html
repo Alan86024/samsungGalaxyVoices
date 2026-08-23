@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Samsung Galaxy Voices</title>
+</head>
+<body>
+<h1>Samsung Galaxy Voices</h1>
+<p>Samsung Galaxy Voices makes compatible Samsung speech voices available locally through NVDA. Once a voice has been installed, speech works offline without a phone, virtual machine, system-wide installation, or continuing network connection.</p>
+
+<h2>Important Notice</h2>
+<p>This is an independent, unofficial project. It is not affiliated with, endorsed by, or supported by Samsung. Samsung owns its speech engines, voice data, product names, and related components.</p>
+<p>The add-on contains no Samsung engine or voice files. It downloads a selected package directly from Samsung only after the user gives permission. Availability can vary by language, region, device profile, or changes made by Samsung. Users are responsible for ensuring that their use complies with the terms and laws that apply to them.</p>
+
+<h2>First Run</h2>
+<p>After installation, NVDA offers to open the Samsung Galaxy Voices settings panel. Choose at least one voice and select Download or update. Before the first download, the add-on explains what will be stored and asks for confirmation.</p>
+<p>The add-on does not appear in NVDA's synthesizer list until a complete voice and its matching engine have been validated. Successfully downloaded voices become available immediately without restarting NVDA.</p>
+
+<h2>Voice Manager</h2>
+<p>Open NVDA Settings and choose Samsung Galaxy Voices. Installed voices appear first. Available premium voices follow, with Samsung's smaller classic voices grouped afterward and identified as Compact. Compact voices use less storage and may run faster, but their speech quality is lower. The list shows each voice's status and Samsung's reported package size. Sizes are retrieved in the background and cached for one day.</p>
+<p>The list identifies installed voices using names embedded in Samsung's package where available, such as Amy Green, Stephanie, Julia, and Lisa. Samsung's own locale remains authoritative; for example, Julia is listed as US English even when her accent may sound different to some listeners.</p>
+<p>Select one voice, or use the standard Control and Shift selection keys to select several. Available actions are:</p>
+<ul>
+<li><strong>Download or update:</strong> downloads selected packages directly from Samsung, one at a time.</li>
+<li><strong>Remove:</strong> removes selected installed voices. A shared engine is removed only when no remaining voice needs it.</li>
+<li><strong>Play sample:</strong> speaks a local sample using one selected installed voice without changing NVDA's active synthesizer.</li>
+<li><strong>Stop sample:</strong> immediately stops sample playback.</li>
+</ul>
+<p>Removed voices disappear from the running synth immediately. If you remove the voice currently speaking, Samsung switches to another installed voice first. The only installed voice cannot be removed while Samsung Galaxy Voices is active; switch synthesizers or install another voice before removing it.</p>
+<p>Downloads continue in the background if the settings window is closed. Reopening Samsung Galaxy Voices shows the active voice as Downloading and keeps Download or update unavailable until it finishes. A focusable two-column status list reports the current voice, stage, batch position, progress, transferred size and download speed without moving your reading position as values change. Voice data is stored in NVDA's user-data folder, outside the add-on, so normal add-on updates preserve it.</p>
+
+<h2>Speech Settings</h2>
+<p>Voice, rate, pitch, and volume are available in NVDA's speech settings and synthesizer settings ring. Rate and pitch use Samsung's native controls. Rate 50 is Samsung's normal speed, with a progressively wider range above 50 for fast screen-reader use. Volume is applied through NVDA's audio path. During Say All, adjacent lines without a natural pause are passed to Samsung as one continuous utterance.</p>
+<p>The Samsung Galaxy Voices panel also provides Playback buffering from 0 to 500 milliseconds, adjustable in 25 millisecond steps. Zero is the default and gives the fastest response. If live speech sounds grainy or breaks up on a slower or heavily loaded computer, increase the value in small steps until playback becomes stable. Higher values delay the beginning of each utterance but do not change the generated voice.</p>
+
+<h2>Updates</h2>
+<p>The Samsung Galaxy Voices panel contains a Check for add-on updates setting with Never, Hourly, and Daily choices. Daily is the default for new installations. Check Now performs an immediate manual check. Update files and their manifests must pass cryptographic signature, package identity, version, size, and SHA-256 checks before NVDA will install them.</p>
+<p>This schedule controls add-on updates. Voice packages are updated only when the user selects Download or update in the voice manager.</p>
+
+<h2>Help</h2>
+<p>Press F1 anywhere in the Samsung Galaxy Voices panel, or choose Help, to open this manual.</p>
+<p>Project source and releases are available from the <a href="https://github.com/OnjLouis/samsungGalaxyVoices">Samsung Galaxy Voices GitHub repository</a>.</p>
+
+<h2>Credits and Licences</h2>
+<ul>
+<li>Created and maintained by Andre Louis.</li>
+<li>The compatibility host is based on <a href="https://github.com/zhkl0228/rnidbg">RNIDBG</a>, licensed under Apache License 2.0.</li>
+<li>ARM64 translation uses <a href="https://github.com/merryhime/dynarmic">Dynarmic</a>, distributed under its ISC-style licence.</li>
+<li>Windows runtime components come from <a href="https://github.com/mstorsjo/llvm-mingw">LLVM-MinGW</a>. Full third-party licence texts are included with the add-on.</li>
+</ul>
+
+<h2>Changes in 1.0.0</h2>
+<ul>
+<li>Added local Samsung Galaxy speech with responsive interruption, spelling, Say All, rate, pitch, and volume support.</li>
+<li>Added a voice manager for direct, user-initiated downloads from Samsung, including multiple selection, background downloads, removal, and local samples.</li>
+<li>Made the public package voice-free and engine-free so proprietary Samsung components are never redistributed by this project.</li>
+<li>Added proper embedded voice names and per-package engine matching with safe deduplication.</li>
+<li>Placed installed voices first in the manager and added cached package download sizes.</li>
+<li>Added Samsung's directly downloadable compact classic voices in a separate group below premium voices.</li>
+<li>Kept background download state independent of the settings window, identified the active voice as Downloading, and added a stable detail list for progress and speed.</li>
+<li>Added optional playback buffering for systems that cannot sustain smooth live speech at the lowest latency.</li>
+<li>Added signed add-on updates with Never, Hourly, Daily, and Check Now controls in the NVDA settings panel.</li>
+<li>Preserved compatible downloaded voices when upgrading from earlier builds.</li>
+</ul>
+</body>
+</html>
