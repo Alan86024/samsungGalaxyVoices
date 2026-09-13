@@ -2,6 +2,7 @@
 """Voice download manager for Samsung Galaxy Voices."""
 
 import builtins
+import concurrent.futures
 import config
 import json
 import os
@@ -455,12 +456,7 @@ class SamsungGalaxyVoicesPanel(gui.settingsDialogs.SettingsPanel):
 		self._rowByCode = {}
 		selectedIndexes = []
 		for catalogIndex, code in enumerate(self._visibleCodes):
-			if code not in _DOWNLOADABLE_CODES:
-				status = _("Installed; legacy quality")
-			elif _isInstalled(code):
-				status = _("Installed; compact") if code in _COMPACT_CODES else _("Installed")
-			else:
-				status = _("Available; compact") if code in _COMPACT_CODES else _("Available")
+			status = self._statusForCode(code)
 			index = self.voiceList.InsertItem(self.voiceList.GetItemCount(), _voiceLabel(code))
 			self.voiceList.SetItem(index, 1, status)
 			cached = self._catalogSizes.get(code)
@@ -482,6 +478,14 @@ class SamsungGalaxyVoicesPanel(gui.settingsDialogs.SettingsPanel):
 			self.voiceList.Focus(selectedIndexes[0])
 		self._updateButtons()
 
+	def _statusForCode(self, code):
+		installed = _isInstalled(code)
+		if code not in _DOWNLOADABLE_CODES:
+			return _("Installed; legacy quality")
+		if installed:
+			return _("Installed; compact") if code in _COMPACT_CODES else _("Installed")
+		return _("Available; compact") if code in _COMPACT_CODES else _("Available")
+
 	def _loadCatalogSizes(self):
 		missing = [code for code in self._visibleCodes if code not in self._catalogSizes]
 		if not missing:
@@ -490,16 +494,34 @@ class SamsungGalaxyVoicesPanel(gui.settingsDialogs.SettingsPanel):
 
 		def worker():
 			updated = dict(self._catalogSizes)
-			for code in missing:
+
+			def retrieve(code):
 				try:
 					metadata = voiceStore.downloadMetadata(code)
-				except Exception:
-					log.debugWarning("Could not retrieve Samsung catalogue size for %s", code, exc_info=True)
-					wx.CallAfter(_callPanel, panelRef, "_showCatalogSizeUnavailable", code)
-					continue
-				entry = {"size": metadata["size"], "checked": time.time()}
-				updated[code] = entry
-				wx.CallAfter(_callPanel, panelRef, "_showCatalogSize", code, entry["size"])
+				except Exception as error:
+					return code, None, error
+				return code, metadata, None
+
+			with concurrent.futures.ThreadPoolExecutor(
+				max_workers=6,
+				thread_name_prefix="Samsung catalogue request",
+			) as executor:
+				results = executor.map(retrieve, missing)
+				for code, metadata, error in results:
+					if error is not None:
+						log.debugWarning(
+							"Could not retrieve Samsung catalogue size for %s: %s",
+							code,
+							error,
+						)
+						wx.CallAfter(_callPanel, panelRef, "_showCatalogSizeUnavailable", code)
+						continue
+					entry = {
+						"size": metadata["size"],
+						"checked": time.time(),
+					}
+					updated[code] = entry
+					wx.CallAfter(_callPanel, panelRef, "_showCatalogEntry", code, entry)
 			try:
 				voiceStore.saveCatalogCache(updated)
 			except OSError:
@@ -507,13 +529,15 @@ class SamsungGalaxyVoicesPanel(gui.settingsDialogs.SettingsPanel):
 
 		threading.Thread(target=worker, name="Samsung voice catalogue", daemon=True).start()
 
-	def _showCatalogSize(self, code, size):
+	def _showCatalogEntry(self, code, entry):
 		if self.IsBeingDeleted():
 			return
 		row = self._rowByCode.get(code)
-		self._catalogSizes[code] = {"size": size, "checked": time.time()}
+		self._catalogSizes[code] = dict(entry)
 		if row is not None:
-			self.voiceList.SetItem(row, 2, _("{size:.1f} MB").format(size=size / (1024 * 1024)))
+			self.voiceList.SetItem(row, 1, self._statusForCode(code))
+			self.voiceList.SetItem(row, 2, _("{size:.1f} MB").format(size=entry["size"] / (1024 * 1024)))
+		self._updateButtons()
 
 	def _showCatalogSizeUnavailable(self, code):
 		if self.IsBeingDeleted():
@@ -579,12 +603,8 @@ class SamsungGalaxyVoicesPanel(gui.settingsDialogs.SettingsPanel):
 		for code, row in self._rowByCode.items():
 			if snapshot["busy"] and code == snapshot["activeCode"]:
 				rowStatus = _("Downloading")
-			elif code not in _DOWNLOADABLE_CODES:
-				rowStatus = _("Installed; legacy quality")
-			elif _isInstalled(code):
-				rowStatus = _("Installed; compact") if code in _COMPACT_CODES else _("Installed")
 			else:
-				rowStatus = _("Available; compact") if code in _COMPACT_CODES else _("Available")
+				rowStatus = self._statusForCode(code)
 			if self.voiceList.GetItemText(row, 1) != rowStatus:
 				self.voiceList.SetItem(row, 1, rowStatus)
 		if snapshot["completedSerial"] != self._seenCompletedSerial:
@@ -726,6 +746,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	def __init__(self):
 		global _activeUpdater
 		super().__init__()
+		removedVoices, migratedVoices = voiceStore.maintainVoiceStore()
+		if removedVoices:
+			log.info("Samsung Galaxy Voices removed %d incompatible voice package(s)", removedVoices)
+		if migratedVoices:
+			log.info("Samsung Galaxy Voices migrated %d voice folder(s)", migratedVoices)
 		if SamsungGalaxyVoicesPanel not in gui.settingsDialogs.NVDASettingsDialog.categoryClasses:
 			gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(SamsungGalaxyVoicesPanel)
 		self._updater = SignedWebUpdater()

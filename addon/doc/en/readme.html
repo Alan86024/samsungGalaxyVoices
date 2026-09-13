@@ -17,8 +17,9 @@
 <p>The add-on does not appear in NVDA's synthesizer list until a complete voice and its matching engine have been validated. Successfully downloaded voices become available immediately without restarting NVDA.</p>
 
 <h2>Voice Manager</h2>
-<p>Open NVDA Settings and choose Samsung Galaxy Voices. Installed voices appear first. Available premium voices follow, with Samsung's smaller classic voices grouped afterward and identified as Compact. Compact voices use less storage and may run faster, but their speech quality is lower. The list shows each voice's status and Samsung's reported package size. Sizes are retrieved in the background and cached for one day.</p>
+<p>Open NVDA Settings and choose Samsung Galaxy Voices. Installed voices appear first. Original-generation and newer Galaxy S24 premium voices follow as separate choices, so matching languages and voices can be installed side by side. Samsung's smaller classic voices are grouped afterward and identified as Compact. Compact voices use less storage and may run faster, but their speech quality is lower. The list shows each voice's status and Samsung's reported package size. Sizes are retrieved in the background and cached for one day.</p>
 <p>The list identifies installed voices using names embedded in Samsung's package where available, such as Amy Green, Stephanie, Julia, and Lisa. Samsung's own locale remains authoritative; for example, Julia is listed as US English even when her accent may sound different to some listeners.</p>
+<p>Packages which cannot generate smooth live speech in real time are not offered. This currently excludes the original and Galaxy S24 Indian premium packages, plus the Galaxy S24 versions of Stephanie and John Lano. The compact Indian voice and the compatible original-generation Stephanie and John Lano voices remain available.</p>
 <p>Select one voice, or use the standard Control and Shift selection keys to select several. Available actions are:</p>
 <ul>
 <li><strong>Download or update:</strong> downloads selected packages directly from Samsung, one at a time.</li>
@@ -36,6 +37,18 @@
 <h2>Updates</h2>
 <p>The Samsung Galaxy Voices panel contains a Check for add-on updates setting with Never, Hourly, and Daily choices. Daily is the default for new installations. Check Now performs an immediate manual check. Update files and their manifests must pass cryptographic signature, package identity, version, size, and SHA-256 checks before NVDA will install them.</p>
 <p>This schedule controls add-on updates. Voice packages are updated only when the user selects Download or update in the voice manager.</p>
+
+<h2>Changes in 1.1.0</h2>
+<ul>
+<li>Added Samsung's newer Galaxy S24 premium voice generation alongside the original-generation voices.</li>
+<li>Excluded the current Galaxy S24 Indian premium, Stephanie, and John Lano packages because measured synthesis could not keep pace with live playback; compatible compact or original-generation alternatives remain available.</li>
+<li>Stopped needlessly replacing helper processes when an S24-packaged voice uses Samsung's compatible original-generation engine.</li>
+<li>Kept newer S24 voices responsive during rapid typing and navigation by recycling their warm speech helpers instead of restarting them for each interruption.</li>
+<li>Added host support for the newer engine format and reliable interruption without undocumented memory access.</li>
+<li>Improved catalogue loading by retrieving package details concurrently while keeping network work outside NVDA's user-interface thread.</li>
+<li>Organised installed voices into generation-specific folders and added automatic migration for existing installations.</li>
+<li>Removed the exact faulty original-generation Indian premium package while retaining the compact Indian voice.</li>
+</ul>
 
 <h2>Help</h2>
 <p>Press F1 anywhere in the Samsung Galaxy Voices panel, or choose Help, to open this manual.</p>

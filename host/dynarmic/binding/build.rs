@@ -92,11 +92,15 @@ fn build_with_cmake() {
         .build();
     println!(
         "cargo:rustc-link-search=native={}",
-        dst.join("build").display()
+        dst.join("build/src/dynarmic").display()
     );
     println!(
         "cargo:rustc-link-search=native={}",
         dst.join("build/externals/fmt").display()
+    );
+    println!(
+        "cargo:rustc-link-search=native={}",
+        dst.join("build/externals/mcl/src").display()
     );
     println!(
         "cargo:rustc-link-search=native={}",
@@ -108,7 +112,8 @@ fn build_with_cmake() {
     );
 
     // Lazymio(@wtdcode): Dynamic link may break. See: https://github.com/rust-lang/cargo/issues/5077
-    println!("cargo:rustc-link-lib=static=dynarmic");
+    println!("cargo:rustc-link-lib=static=dynarmic-static");
+    println!("cargo:rustc-link-lib=static=mcl");
     if !compiler.is_like_msvc() {
         println!("cargo:rustc-link-lib=pthread");
         println!("cargo:rustc-link-lib=m");
@@ -124,6 +129,7 @@ fn build_with_cmake() {
 fn main() {
     println!("cargo:rerun-if-changed=src/dynarmic/dynarmic.cpp");
     println!("cargo:rerun-if-changed=src/dynarmic/dynarmic.h");
+    println!("cargo:rerun-if-changed=src/dynarmic/frontend/A64/translate/impl/load_store_register_immediate.cpp");
     match pkg_config::Config::new()
         .atleast_version("2")
         .cargo_metadata(false)

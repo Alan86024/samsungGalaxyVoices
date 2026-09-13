@@ -70,13 +70,83 @@ class InstallMigrationTests(unittest.TestCase):
 		self.module.onInstall()
 		voices = self.config / "samsungGalaxyVoices" / "voices"
 		for folder in ("en-gb-l02", "en-gb-g02", "en-us-l03"):
-			metadata = json.loads((voices / folder / "voice.json").read_text(encoding="utf-8"))
+			metadata = json.loads((voices / "legacy" / folder / "voice.json").read_text(encoding="utf-8"))
 			self.assertRegex(metadata["engineHash"], r"^[0-9a-f]{64}$")
 			engine = self.config / "samsungGalaxyVoices" / "engines" / metadata["engineHash"] / "libsamsungtts.so"
 			self.assertTrue(engine.is_file())
-		self.assertEqual("Stephanie", json.loads((voices / "en-us-l03" / "voice.json").read_text())["name"])
-		julia = json.loads((voices / "en-us-l04" / "voice.json").read_text(encoding="utf-8"))
+		self.assertEqual("Stephanie", json.loads((voices / "legacy" / "en-us-l03" / "voice.json").read_text())["name"])
+		julia = json.loads((voices / "legacy" / "en-us-l04" / "voice.json").read_text(encoding="utf-8"))
 		self.assertEqual(self.dedicated_hash, julia["engineHash"])
+		self.assertFalse((voices / "en-us-l03").exists())
+		self.assertFalse((voices / "en-us-l04").exists())
+
+	def test_public_upgrade_migrates_complete_flat_voices_without_bundled_engine(self):
+		sys.modules["addonHandler"].getAvailableAddons = lambda: []
+		self.module.onInstall()
+
+		voices = self.config / "samsungGalaxyVoices" / "voices"
+		self.assertTrue((voices / "legacy" / "en-us-l04" / "voice.json").is_file())
+		self.assertFalse((voices / "en-us-l04").exists())
+		self.assertTrue((voices / "en-us-l03").is_dir(), "An incomplete voice must not be moved")
+
+	def test_migrates_a_newer_generation_to_its_own_folder(self):
+		voices = self.config / "samsungGalaxyVoices" / "voices"
+		source = voices / "en-us-l03--s24"
+		(source / "assets").mkdir(parents=True)
+		(source / "assets" / "cfg").write_bytes(b"name\0Stephanie\0")
+		(source / "assets" / "lng").write_bytes(b"language")
+		(source / "assets" / "regular.ivc").write_bytes(b"voice")
+		(source / "voice.json").write_text(json.dumps({
+			"id": "en_US_l03_s24", "language": "en_US", "family": "l", "speaker": 3,
+			"name": "Stephanie", "generation": "s24", "catalogKey": "en_us_l03@s24",
+			"version": "312501000", "engineHash": self.dedicated_hash,
+		}), encoding="utf-8")
+		sys.modules["addonHandler"].getAvailableAddons = lambda: []
+
+		self.module.onInstall()
+
+		self.assertTrue((voices / "s24" / "en-us-l03" / "voice.json").is_file())
+		self.assertFalse(source.exists())
+
+	def test_removes_exact_incompatible_voice_packages(self):
+		voices = self.config / "samsungGalaxyVoices" / "voices"
+		bad = voices / "en-in-l02"
+		(bad / "assets").mkdir(parents=True)
+		for filename in ("cfg", "lng", "regular.ivc"):
+			(bad / "assets" / filename).write_bytes(b"voice")
+		(bad / "voice.json").write_text(json.dumps({
+			"id": "en_IN_l02", "language": "en_IN", "family": "l", "speaker": 2,
+			"name": "Indian premium", "version": "312347000",
+			"engineHash": self.dedicated_hash,
+		}), encoding="utf-8")
+		sys.modules["addonHandler"].getAvailableAddons = lambda: []
+
+		self.module.onInstall()
+
+		self.assertFalse(bad.exists())
+		self.assertTrue(
+			(self.config / "samsungGalaxyVoices" / "engines" / self.dedicated_hash / "libsamsungtts.so").is_file(),
+			"The engine is still used by Julia and must be retained",
+		)
+
+		for folder, identifier, key, version in (
+			("en-in-l02", "en_IN_l02_s24", "en_in_l02@s24", "312501000"),
+			("en-us-l03", "en_US_l03_s24", "en_us_l03@s24", "312504000"),
+			("en-us-g02", "en_US_g02_s24", "en_us_g02@s24", "312504000"),
+		):
+			voice = voices / "s24" / folder
+			(voice / "assets").mkdir(parents=True, exist_ok=True)
+			for filename in ("cfg", "lng", "regular.ivc"):
+				(voice / "assets" / filename).write_bytes(b"voice")
+			(voice / "voice.json").write_text(json.dumps({
+				"id": identifier, "catalogKey": key, "generation": "s24",
+				"version": version, "engineHash": self.dedicated_hash,
+			}), encoding="utf-8")
+
+		self.module.onInstall()
+
+		for folder in ("en-in-l02", "en-us-l03", "en-us-g02"):
+			self.assertFalse((voices / "s24" / folder).exists())
 
 
 if __name__ == "__main__":

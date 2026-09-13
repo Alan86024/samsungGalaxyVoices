@@ -51,9 +51,32 @@ COMPACT_CODES = (
 	"th_th_f00", "tr_tr_f00", "vi_vn_f00", "zh_cn_f00", "zh_cn_m00",
 	"zh_hk_f00", "zh_tw_f00",
 )
-CATALOG_CODES = PREMIUM_CODES + COMPACT_CODES
-# The Indian package has produced invalid audio with the compatible engine generation.
-DOWNLOADABLE_CODES = tuple(code for code in CATALOG_CODES if code != "en_in_l02")
+GENERATION_PROFILES = OrderedDict((
+	("legacy", {
+		"label": "Original generation", "deviceId": "SM-G970F", "sdkVer": "29",
+	}),
+	("s24", {
+		"label": "Galaxy S24 generation", "deviceId": "SM-S921B", "sdkVer": "34",
+	}),
+))
+DISABLED_CATALOG_KEYS = frozenset({
+	"en_in_l02",
+	"en_in_l02@s24",
+	"en_us_g02@s24",
+	"en_us_l03@s24",
+})
+CATALOG_CODES = (
+	tuple(code for code in PREMIUM_CODES if code not in DISABLED_CATALOG_KEYS)
+	+ tuple(f"{code}@s24" for code in PREMIUM_CODES if f"{code}@s24" not in DISABLED_CATALOG_KEYS)
+	+ COMPACT_CODES
+)
+DOWNLOADABLE_CODES = CATALOG_CODES
+KNOWN_BAD_PACKAGES = frozenset({
+	("en_in_l02", "legacy", "312347000"),
+	("en_in_l02", "s24", "312501000"),
+	("en_us_g02", "s24", "312504000"),
+	("en_us_l03", "s24", "312504000"),
+})
 LANGUAGE_NAMES = {
 	"cs_CZ": "Czech", "da_DK": "Danish", "de_DE": "German", "el_GR": "Greek",
 	"en_AU": "Australian English", "en_GB": "UK English", "en_IN": "Indian English",
@@ -114,7 +137,7 @@ def loadCatalogCache():
 	now = time.time()
 	valid = {}
 	for code, entry in cache.items():
-		if not isinstance(entry, dict):
+		if code not in CATALOG_CODES or not isinstance(entry, dict):
 			continue
 		try:
 			size = int(entry["size"])
@@ -134,18 +157,68 @@ def saveCatalogCache(cache):
 	os.replace(temporaryPath, CATALOG_CACHE_PATH)
 
 
-def voiceId(code):
+def splitVoiceKey(key):
+	if "@" in key:
+		code, generation = key.rsplit("@", 1)
+	else:
+		code, generation = key, "legacy"
+	if generation not in GENERATION_PROFILES:
+		raise ValueError(f"Unknown Samsung voice generation: {generation}")
+	if not re.fullmatch(r"[a-z]{2}_[a-z]{2}_[fglm]\d{2}", code):
+		raise ValueError(f"Invalid Samsung voice code: {code}")
+	return code, generation
+
+
+def voiceId(key):
+	code, generation = splitVoiceKey(key)
 	parts = code.split("_")
-	return f"{parts[0]}_{parts[1].upper()}_{parts[2]}"
+	identifier = f"{parts[0]}_{parts[1].upper()}_{parts[2]}"
+	return identifier if generation == "legacy" else f"{identifier}_{generation}"
 
 
-def languageId(code):
+def languageId(key):
+	code, _generation = splitVoiceKey(key)
 	parts = code.split("_")
 	return f"{parts[0]}_{parts[1].upper()}"
 
 
-def voicePath(code):
-	return os.path.join(VOICES_DIR, code.replace("_", "-"))
+def voicePath(key):
+	code, generation = splitVoiceKey(key)
+	return os.path.join(VOICES_DIR, generation, code.replace("_", "-"))
+
+
+def _legacyVoicePath(key):
+	code, generation = splitVoiceKey(key)
+	folder = code.replace("_", "-")
+	if generation != "legacy":
+		folder += f"--{generation}"
+	return os.path.join(VOICES_DIR, folder)
+
+
+def _existingVoicePath(key):
+	canonical = voicePath(key)
+	return canonical if os.path.isdir(canonical) else _legacyVoicePath(key)
+
+
+def _iterVoiceDirectories():
+	try:
+		rootEntries = list(os.scandir(VOICES_DIR))
+	except OSError:
+		return
+	for entry in rootEntries:
+		if not entry.is_dir(follow_symlinks=False):
+			continue
+		if entry.name not in GENERATION_PROFILES:
+			yield entry.path
+			continue
+		try:
+			generationEntries = os.scandir(entry.path)
+		except OSError:
+			continue
+		with generationEntries:
+			for voiceEntry in generationEntries:
+				if voiceEntry.is_dir(follow_symlinks=False):
+					yield voiceEntry.path
 
 
 def enginePath(engineHash):
@@ -154,25 +227,32 @@ def enginePath(engineHash):
 
 def readVoiceMetadata(code):
 	try:
-		with open(os.path.join(voicePath(code), "voice.json"), "r", encoding="utf-8") as metadataFile:
+		with open(os.path.join(_existingVoicePath(code), "voice.json"), "r", encoding="utf-8") as metadataFile:
 			return json.load(metadataFile)
 	except (OSError, ValueError, TypeError):
 		return None
 
 
-def voiceLabel(code):
-	metadata = readVoiceMetadata(code) or {}
-	language = languageId(code)
-	name = str(metadata.get("name") or KNOWN_NAMES.get(voiceId(code)) or "").strip()
+def voiceLabel(key):
+	code, generation = splitVoiceKey(key)
+	metadata = readVoiceMetadata(key) or {}
+	language = languageId(key)
+	baseVoiceId = voiceId(code)
+	name = str(metadata.get("name") or KNOWN_NAMES.get(baseVoiceId) or "").strip()
 	languageName = LANGUAGE_NAMES.get(language, language.replace("_", " "))
 	if name:
-		return f"{languageName} - {name}"
-	family = code.rsplit("_", 1)[1]
-	gender = "male" if family.startswith(("g", "m")) else "female"
-	return f"{languageName}, {gender}, voice {family}"
+		label = f"{languageName} - {name}"
+	else:
+		family = code.rsplit("_", 1)[1]
+		gender = "male" if family.startswith(("g", "m")) else "female"
+		label = f"{languageName}, {gender}, voice {family}"
+	if generation != "legacy":
+		label += f" ({GENERATION_PROFILES[generation]['label']})"
+	return label
 
 
-def _modelName(code, metadata=None):
+def _modelName(key, metadata=None):
+	code, _generation = splitVoiceKey(key)
 	metadata = metadata or {}
 	model = str(metadata.get("model") or "")
 	if model in {"regular.ivc", "tiny.ivc"}:
@@ -185,7 +265,7 @@ def isInstalled(code):
 	if not isinstance(metadata, dict):
 		return False
 	engineHash = str(metadata.get("engineHash") or "")
-	path = voicePath(code)
+	path = _existingVoicePath(code)
 	return bool(re.fullmatch(r"[0-9a-f]{64}", engineHash)) and (
 		os.path.isfile(enginePath(engineHash))
 		and all(os.path.isfile(os.path.join(path, "assets", filename)) for filename in ("cfg", "lng", _modelName(code, metadata)))
@@ -193,36 +273,54 @@ def isInstalled(code):
 
 
 def loadVoiceDefinitions():
-	definitions = []
-	try:
-		entries = os.scandir(VOICES_DIR)
-	except OSError:
-		return OrderedDict()
-	with entries:
-		for entry in entries:
-			if not entry.is_dir(follow_symlinks=False):
+	maintainVoiceStore()
+	definitions = {}
+	for voiceDirectory in _iterVoiceDirectories():
+		try:
+			with open(os.path.join(voiceDirectory, "voice.json"), "r", encoding="utf-8") as metadataFile:
+				metadata = json.load(metadataFile)
+		except (OSError, ValueError, TypeError):
+			continue
+		try:
+			engineHash = str(metadata["engineHash"])
+			model = str(metadata.get("model") or "regular.ivc")
+			identifier = str(metadata["id"])
+			generation = str(metadata.get("generation") or "legacy")
+			catalogKey = _voiceKeyFromMetadata(metadata)
+			if isBlockedPackage(catalogKey, metadata.get("version")):
 				continue
-			code = entry.name.replace("-", "_")
-			metadata = readVoiceMetadata(code)
-			if not metadata or not isInstalled(code):
-				continue
-			try:
-				item = {
-					"id": str(metadata["id"]),
-					"name": str(metadata["name"]),
-					"path": entry.path,
-					"enginePath": enginePath(str(metadata["engineHash"])),
-					"family": str(metadata["family"]),
-					"speaker": int(metadata["speaker"]),
-					"language": str(metadata["language"]),
-				}
-			except (KeyError, TypeError, ValueError):
-				continue
-			if item["family"] not in {"f", "g", "l", "m"} or not 0 <= item["speaker"] <= 99:
-				continue
-			definitions.append(item)
-	definitions.sort(key=lambda item: item["name"].casefold())
-	return OrderedDict((item.pop("id"), item) for item in definitions)
+			item = {
+				"id": identifier,
+				"name": str(metadata["name"]),
+				"path": voiceDirectory,
+				"enginePath": enginePath(engineHash),
+				"family": str(metadata["family"]),
+				"speaker": int(metadata["speaker"]),
+				"language": str(metadata["language"]),
+				"generation": generation,
+				"canonical": os.path.basename(os.path.dirname(voiceDirectory)) in GENERATION_PROFILES,
+			}
+		except (KeyError, TypeError, ValueError):
+			continue
+		if (
+			item["family"] not in {"f", "g", "l", "m"}
+			or item["generation"] not in GENERATION_PROFILES
+			or not 0 <= item["speaker"] <= 99
+			or not re.fullmatch(r"[0-9a-f]{64}", engineHash)
+			or not os.path.isfile(enginePath(engineHash))
+			or not all(os.path.isfile(os.path.join(voiceDirectory, "assets", filename)) for filename in ("cfg", "lng", model))
+		):
+			continue
+		current = definitions.get(identifier)
+		if current is None or item["canonical"] and not current["canonical"]:
+			definitions[identifier] = item
+	result = OrderedDict()
+	for identifier, item in sorted(definitions.items(), key=lambda pair: pair[1]["name"].casefold()):
+		item = dict(item)
+		item.pop("canonical")
+		item.pop("id")
+		result[identifier] = item
+	return result
 
 
 def _isSamsungHost(url):
@@ -230,11 +328,18 @@ def _isSamsungHost(url):
 	return host == "samsungapps.com" or host.endswith(".samsungapps.com")
 
 
-def downloadMetadata(code):
+def isBlockedPackage(key, version):
+	code, generation = splitVoiceKey(key)
+	return (code, generation, str(version)) in KNOWN_BAD_PACKAGES
+
+
+def downloadMetadata(key):
+	code, generation = splitVoiceKey(key)
+	profile = GENERATION_PROFILES[generation]
 	packageName = f"com.samsung.SMT.lang_{code}"
 	params = urllib.parse.urlencode({
-		"appId": packageName, "deviceId": "SM-G970F", "mcc": "234", "mnc": "15",
-		"csc": "BTU", "sdkVer": "29", "pd": "0", "systemId": "0",
+		"appId": packageName, "deviceId": profile["deviceId"], "mcc": "234", "mnc": "15",
+		"csc": "BTU", "sdkVer": profile["sdkVer"], "pd": "0", "systemId": "0",
 		"callerId": "com.sec.android.app.samsungapps", "abiType": "64",
 		"extuk": "0000000000000000",
 	})
@@ -252,9 +357,15 @@ def downloadMetadata(code):
 	size = int(root.findtext("contentSize") or 0)
 	if not 1024 * 1024 <= size <= MAX_PACKAGE_SIZE:
 		raise RuntimeError("Samsung returned an invalid package size.")
+	version = root.findtext("versionCode") or ""
 	return {
-		"url": downloadUrl, "size": size, "version": root.findtext("versionCode") or "",
-		"productName": root.findtext("productName") or voiceLabel(code), "package": packageName,
+		"url": downloadUrl,
+		"size": size,
+		"version": version,
+		"productName": root.findtext("productName") or voiceLabel(key),
+		"package": packageName,
+		"generation": generation,
+		"blocked": isBlockedPackage(key, version),
 	}
 
 
@@ -307,10 +418,17 @@ def _validateEngine(path):
 
 
 _installLock = threading.Lock()
+_maintenanceLock = threading.Lock()
+_maintenanceComplete = False
 
 
-def _installVoice(code, progress):
-	metadata = downloadMetadata(code)
+def _installVoice(key, progress):
+	code, generation = splitVoiceKey(key)
+	metadata = downloadMetadata(key)
+	if isBlockedPackage(key, metadata.get("version")):
+		raise RuntimeError(
+			"This Samsung voice package cannot generate audio in real time reliably and is not supported."
+		)
 	os.makedirs(DATA_ROOT, exist_ok=True)
 	workDir = tempfile.mkdtemp(prefix="voice-", dir=DATA_ROOT)
 	packagePath = os.path.join(workDir, "voice.apk")
@@ -360,15 +478,16 @@ def _installVoice(code, progress):
 		parts = code.split("_")
 		name = _cfgValue(values, "name") or KNOWN_NAMES.get(voiceId(code)) or metadata["productName"]
 		voiceMetadata = {
-			"id": voiceId(code), "language": languageId(code), "family": parts[2][0],
+			"id": voiceId(key), "language": languageId(key), "family": parts[2][0],
 			"speaker": int(parts[2][1:]), "name": name,
 			"productName": metadata["productName"], "package": metadata["package"],
-			"version": metadata["version"], "engineHash": engineHash, "model": modelName,
+			"version": metadata["version"], "generation": generation,
+			"catalogKey": key, "engineHash": engineHash, "model": modelName,
 		}
 		with open(os.path.join(stagingPath, "voice.json"), "w", encoding="utf-8") as metadataFile:
 			json.dump(voiceMetadata, metadataFile, ensure_ascii=True, indent=2)
-		targetPath = voicePath(code)
-		os.makedirs(VOICES_DIR, exist_ok=True)
+		targetPath = voicePath(key)
+		os.makedirs(os.path.dirname(targetPath), exist_ok=True)
 		backupPath = targetPath + ".old"
 		if os.path.isdir(backupPath):
 			shutil.rmtree(backupPath)
@@ -397,23 +516,21 @@ def installVoice(code, progress):
 
 def removeVoices(codes):
 	for code in codes:
-		shutil.rmtree(voicePath(code))
+		shutil.rmtree(_existingVoicePath(code))
 	garbageCollectEngines()
 
 
 def garbageCollectEngines():
 	referenced = set()
-	try:
-		with os.scandir(VOICES_DIR) as entries:
-			for entry in entries:
-				if not entry.is_dir(follow_symlinks=False):
-					continue
-				metadata = readVoiceMetadata(entry.name.replace("-", "_")) or {}
-				engineHash = str(metadata.get("engineHash") or "")
-				if re.fullmatch(r"[0-9a-f]{64}", engineHash):
-					referenced.add(engineHash)
-	except OSError:
-		pass
+	for voiceDirectory in _iterVoiceDirectories():
+		try:
+			with open(os.path.join(voiceDirectory, "voice.json"), "r", encoding="utf-8") as metadataFile:
+				metadata = json.load(metadataFile)
+		except (OSError, ValueError, TypeError):
+			metadata = {}
+		engineHash = str(metadata.get("engineHash") or "")
+		if re.fullmatch(r"[0-9a-f]{64}", engineHash):
+			referenced.add(engineHash)
 	try:
 		engineEntries = os.scandir(ENGINES_DIR)
 	except OSError:
@@ -422,3 +539,92 @@ def garbageCollectEngines():
 		for entry in engineEntries:
 			if entry.is_dir(follow_symlinks=False) and entry.name not in referenced:
 				shutil.rmtree(entry.path, ignore_errors=True)
+
+
+def _voiceKeyFromMetadata(metadata):
+	generation = str(metadata.get("generation") or "legacy")
+	catalogKey = str(metadata.get("catalogKey") or "").lower()
+	if catalogKey:
+		return catalogKey
+	identifier = str(metadata.get("id") or "").lower()
+	if generation != "legacy" and identifier.endswith(f"_{generation}"):
+		identifier = identifier[:-(len(generation) + 1)]
+	return identifier if generation == "legacy" else f"{identifier}@{generation}"
+
+
+def _removeBlockedVoicePackages():
+	removed = 0
+	for voiceDirectory in tuple(_iterVoiceDirectories()):
+		try:
+			with open(os.path.join(voiceDirectory, "voice.json"), "r", encoding="utf-8") as metadataFile:
+				metadata = json.load(metadataFile)
+		except (OSError, ValueError, TypeError):
+			continue
+		try:
+			blocked = isBlockedPackage(_voiceKeyFromMetadata(metadata), metadata.get("version"))
+		except ValueError:
+			continue
+		if not blocked:
+			continue
+		try:
+			shutil.rmtree(voiceDirectory)
+		except OSError:
+			continue
+		removed += 1
+	return removed
+
+
+def _migrateVoiceLayout():
+	migrated = 0
+	try:
+		rootEntries = list(os.scandir(VOICES_DIR))
+	except OSError:
+		return migrated
+	for entry in rootEntries:
+		if not entry.is_dir(follow_symlinks=False) or entry.name in GENERATION_PROFILES:
+			continue
+		try:
+			with open(os.path.join(entry.path, "voice.json"), "r", encoding="utf-8") as metadataFile:
+				metadata = json.load(metadataFile)
+			key = _voiceKeyFromMetadata(metadata)
+			code, generation = splitVoiceKey(key)
+		except (OSError, ValueError, TypeError):
+			continue
+		engineHash = str(metadata.get("engineHash") or "")
+		model = _modelName(key, metadata)
+		if (
+			not re.fullmatch(r"[0-9a-f]{64}", engineHash)
+			or not os.path.isfile(enginePath(engineHash))
+			or not all(os.path.isfile(os.path.join(entry.path, "assets", filename)) for filename in ("cfg", "lng", model))
+		):
+			continue
+		target = os.path.join(VOICES_DIR, generation, code.replace("_", "-"))
+		if os.path.exists(target):
+			continue
+		try:
+			os.makedirs(os.path.dirname(target), exist_ok=True)
+			os.replace(entry.path, target)
+		except OSError:
+			continue
+		migrated += 1
+	return migrated
+
+
+def maintainVoiceStore():
+	"""Apply bounded, idempotent data maintenance before voices are exposed."""
+	global _maintenanceComplete
+	with _maintenanceLock:
+		if _maintenanceComplete:
+			return 0, 0
+		removed = _removeBlockedVoicePackages()
+		migrated = _migrateVoiceLayout()
+		if removed:
+			garbageCollectEngines()
+		_maintenanceComplete = True
+		return removed, migrated
+
+
+def removeBlockedVoicePackages():
+	"""Compatibility wrapper for callers interested only in removed packages."""
+	removed, _migrated = maintainVoiceStore()
+	return removed

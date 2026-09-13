@@ -406,7 +406,11 @@ impl<'a, T: Clone> AndroidElfLoader<'a, T> {
             let mut module_symbol: Option<ModuleSymbol> = None;
             match typ as u32 {
                 R_AARCH64_ABS64 => {
-                    let offset = relocation_addr.read_i64_with_offset(0)?;
+                    let offset = select_relocation_addend(
+                        relocation.has_addend,
+                        relocation.addend,
+                        || relocation_addr.read_i64_with_offset(0),
+                    )?;
                     module_symbol = self.resolve_symbol(load_base, &symbol, &relocation_addr, so_name.as_str(), &needed_libraries, offset as u64, emulator, elf_file)
                         .map_err(|e| warn!("resolve symbol failed: {:?}", e))
                         .ok();
@@ -712,6 +716,43 @@ impl<'a, T: Clone> AndroidElfLoader<'a, T> {
         let tls = VMPointer::new(self.backend.reg_read(RegisterARM64::TPIDR_EL0).unwrap(), 0, self.backend.clone());
         let argv = self.environ.share_with_size(-8 * 2, 0);
         tls.write_u64_with_offset(8 * 3, argv.addr).unwrap();
+    }
+}
+
+fn select_relocation_addend<F>(
+    has_explicit_addend: bool,
+    explicit_addend: i64,
+    read_implicit_addend: F,
+) -> anyhow::Result<i64>
+where
+    F: FnOnce() -> anyhow::Result<i64>,
+{
+    if has_explicit_addend {
+        Ok(explicit_addend)
+    } else {
+        read_implicit_addend()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_relocation_addend;
+
+    #[test]
+    fn explicit_rela_addend_does_not_read_implicit_value() {
+        let result = select_relocation_addend(true, 0x18, || {
+            panic!("RELA relocation must not read an implicit addend")
+        })
+        .unwrap();
+
+        assert_eq!(result, 0x18);
+    }
+
+    #[test]
+    fn rel_addend_is_read_from_relocation_target() {
+        let result = select_relocation_addend(false, 0, || Ok(-24)).unwrap();
+
+        assert_eq!(result, -24);
     }
 }
 

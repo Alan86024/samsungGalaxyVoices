@@ -1,6 +1,8 @@
 import importlib.util
 from collections import OrderedDict
 import ctypes
+import io
+import json
 import os
 import sys
 import threading
@@ -105,9 +107,18 @@ class VoiceInfo:
 
 
 class Log:
-	def debug(self, *args, **kwargs): pass
-	def debugWarning(self, *args, **kwargs): pass
-	def error(self, *args, **kwargs): pass
+	def _write(self, level, *args):
+		if os.environ.get("SAMSUNG_GALAXY_TEST_TRACE") == "1":
+			print(level, *args)
+
+	def debug(self, *args, **kwargs):
+		self._write("DEBUG", *args)
+
+	def debugWarning(self, *args, **kwargs):
+		self._write("WARNING", *args)
+
+	def error(self, *args, **kwargs):
+		self._write("ERROR", *args)
 
 
 config = types.ModuleType("config")
@@ -147,18 +158,79 @@ sys.modules["synthDriverHandler"] = synth
 from synthDrivers._samsungGalaxyVoices import voiceStore as voice_store
 data_dir = ROOT / "addon" / "synthDrivers" / "_samsungGalaxyVoices"
 fixture_dir = Path(FIXTURE)
-voice_store.loadVoiceDefinitions = lambda: OrderedDict((("en_GB_l02", {
-	"name": "Amy Green",
-	"path": str(fixture_dir / "voices" / "en-gb-l02"),
-	"enginePath": str(fixture_dir / "engines" / "regular" / "libsamsungtts.so"),
-	"family": "l",
-	"speaker": 2,
-	"language": "en_GB",
-}),))
+custom_voice_path = os.environ.get("SAMSUNG_GALAXY_TEST_VOICE")
+custom_voice_id = os.environ.get("SAMSUNG_GALAXY_TEST_VOICE_ID", "en_IN_l02_s24")
+custom_generation = os.environ.get("SAMSUNG_GALAXY_TEST_GENERATION", "legacy")
+
+
+def fixtureVoice(identifier):
+	if custom_voice_path and identifier == custom_voice_id:
+		return {
+			"name": os.environ.get("SAMSUNG_GALAXY_TEST_VOICE_NAME", "Integration test voice"),
+			"path": custom_voice_path,
+			"enginePath": os.environ["SAMSUNG_GALAXY_TEST_ENGINE"],
+			"family": os.environ.get("SAMSUNG_GALAXY_TEST_FAMILY", "l"),
+			"speaker": int(os.environ.get("SAMSUNG_GALAXY_TEST_SPEAKER", "2")),
+			"language": os.environ.get("SAMSUNG_GALAXY_TEST_LANGUAGE", "en_IN"),
+			"generation": custom_generation,
+		}
+	voicePath = fixture_dir / "voices" / identifier.replace("_", "-").lower()
+	metadata = json.loads((voicePath / "voice.json").read_text(encoding="utf-8"))
+	return {
+		"name": metadata["name"],
+		"path": str(voicePath),
+		"enginePath": str(fixture_dir / "engines" / metadata["engineHash"] / "libsamsungtts.so"),
+		"family": metadata["family"],
+		"speaker": int(metadata["speaker"]),
+		"language": metadata["language"],
+		"generation": metadata.get("generation", "legacy"),
+	}
+
+
+initial_voice_id = custom_voice_id if custom_voice_path else "en_GB_l02"
+voice_store.loadVoiceDefinitions = lambda: OrderedDict(((initial_voice_id, fixtureVoice(initial_voice_id)),))
 
 spec = importlib.util.spec_from_file_location("samsungGalaxyVoices", DRIVER)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+if os.environ.get("SAMSUNG_GALAXY_TEST_HOST"):
+	module._HOST_PATH = os.environ["SAMSUNG_GALAXY_TEST_HOST"]
+
+
+class BlockingFirstPutQueue:
+	def __init__(self):
+		self.entered = threading.Event()
+		self.release = threading.Event()
+		self.items = []
+
+	def put(self, item):
+		if not self.items:
+			self.entered.set()
+			if not self.release.wait(2):
+				raise RuntimeError("test queue insertion was not released")
+		self.items.append(item)
+
+
+def verifyTerminalFramePublicationOrder():
+	host = module._SamsungHost()
+	process = types.SimpleNamespace(stdout=io.BytesIO(b"C\x00\x00\x00\x00"))
+	messages = BlockingFirstPutQueue()
+	host._process = process
+	host._messages = messages
+	reader = threading.Thread(target=host._reader, args=(process,), daemon=True)
+	reader.start()
+	if not messages.entered.wait(2):
+		raise RuntimeError("terminal frame did not reach the message queue")
+	eventWasEarly = host._terminalEvent.is_set()
+	messages.release.set()
+	reader.join(2)
+	if eventWasEarly:
+		raise RuntimeError("terminal event became visible before its frame was queued")
+	if not host._terminalEvent.is_set():
+		raise RuntimeError("terminal event was not set after its frame was queued")
+
+
+verifyTerminalFramePublicationOrder()
 driver = module.SynthDriver()
 driver.setPlaybackBufferMilliseconds(
 	250 if os.environ.get("SAMSUNG_GALAXY_TEST_BUFFERED") == "1" else 0
@@ -210,7 +282,7 @@ try:
 		raise RuntimeError("routine replacement did not finish")
 	Player.instances[-1].first_feed.clear()
 	synth.synthDoneSpeaking.event.clear()
-	driver.speak(["The cancelled sentence must never delay its replacement. " * 10])
+	driver.speak(["The cancelled sentence must never delay its replacement. " * 3])
 	if not Player.instances[-1].first_feed.wait(10):
 		raise RuntimeError("initial speech produced no audio")
 	started = time.perf_counter()
@@ -233,12 +305,12 @@ try:
 	replacement_pids = {driver._host._process.pid, driver._standbyHost._process.pid}
 	print(f"replacement helper pids: {sorted(replacement_pids)}")
 	if replacement_pids != set(initial_pids):
-		raise RuntimeError("a cooperative interruption replaced a warm helper")
+		raise RuntimeError("a short interruption replaced an otherwise reusable warm helper")
 
 	for iteration in range(30):
 		current_player = Player.instances[-1]
 		current_player.first_feed.clear()
-		driver.speak(["Recycle Bin, 4 of 46"])
+		driver.speak(["a"])
 		if not current_player.first_feed.wait(5):
 			raise RuntimeError(f"rapid request {iteration + 1} produced no audio")
 		driver.cancel()
@@ -257,9 +329,11 @@ try:
 	print(f"rapid-churn helper pids: {sorted(churn_pids)}")
 	if churn_pids != set(initial_pids):
 		raise RuntimeError("rapid interruption churned the warm helper pool")
+	if len(churn_pids) != 2:
+		raise RuntimeError("rapid interruption did not leave two warm helpers")
 
 	for iteration in range(20):
-		driver.speak(["Cancel this deliberately long request before its first audio callback. " * 8])
+		driver.speak(["b"])
 		deadline = time.monotonic() + 2
 		while driver._synthesizingHost is None and time.monotonic() < deadline:
 			time.sleep(0.001)
@@ -281,6 +355,8 @@ try:
 	print(f"pre-audio-cancel helper pids: {sorted(preAudioPids)}")
 	if preAudioPids != set(initial_pids):
 		raise RuntimeError("pre-audio cancellation churned the warm helper pool")
+	if len(preAudioPids) != 2:
+		raise RuntimeError("pre-audio cancellation did not leave two warm helpers")
 	idleProcesses = (driver._host._process, driver._standbyHost._process)
 	idleBefore = [processCpuSeconds(process) for process in idleProcesses]
 	time.sleep(2)
@@ -289,37 +365,23 @@ try:
 	if any(value > 0.1 for value in idleCpu):
 		raise RuntimeError("an idle Samsung helper continued consuming CPU")
 
-	voice_store.loadVoiceDefinitions = lambda: OrderedDict((
-		("en_GB_l02", {
-			"name": "Amy Green",
-			"path": str(fixture_dir / "voices" / "en-gb-l02"),
-			"enginePath": str(fixture_dir / "engines" / "regular" / "libsamsungtts.so"),
-			"family": "l", "speaker": 2, "language": "en_GB",
-		}),
-		("en_GB_g02", {
-			"name": "Chris Green",
-			"path": str(fixture_dir / "voices" / "en-gb-g02"),
-			"enginePath": str(fixture_dir / "engines" / "regular" / "libsamsungtts.so"),
-			"family": "g", "speaker": 2, "language": "en_GB",
-		}),
-	))
-	driver.refreshAvailableVoices()
-	if tuple(driver._get_availableVoices()) != ("en_GB_l02", "en_GB_g02"):
-		raise RuntimeError("downloaded voice did not enter the live voice list")
-	fallbackName = driver.prepareVoicesForRemoval(("en_GB_l02",))
-	if fallbackName != "Chris Green" or driver._get_voice() != "en_GB_g02":
-		raise RuntimeError("active voice removal did not select the available fallback")
-	voice_store.loadVoiceDefinitions = lambda: OrderedDict((
-		("en_GB_g02", {
-			"name": "Chris Green",
-			"path": str(fixture_dir / "voices" / "en-gb-g02"),
-			"enginePath": str(fixture_dir / "engines" / "regular" / "libsamsungtts.so"),
-			"family": "g", "speaker": 2, "language": "en_GB",
-		}),
-	))
-	driver.refreshAvailableVoices()
-	driver._set_voice("en_GB_l02")
-	if driver._get_voice() != "en_GB_g02" or tuple(driver._get_availableVoices()) != ("en_GB_g02",):
-		raise RuntimeError("removed voice remained selectable or displaced the speaking fallback")
+	if not custom_voice_path:
+		voice_store.loadVoiceDefinitions = lambda: OrderedDict((
+			("en_GB_l02", fixtureVoice("en_GB_l02")),
+			("en_GB_g02", fixtureVoice("en_GB_g02")),
+		))
+		driver.refreshAvailableVoices()
+		if tuple(driver._get_availableVoices()) != ("en_GB_l02", "en_GB_g02"):
+			raise RuntimeError("downloaded voice did not enter the live voice list")
+		fallbackName = driver.prepareVoicesForRemoval(("en_GB_l02",))
+		if fallbackName != fixtureVoice("en_GB_g02")["name"] or driver._get_voice() != "en_GB_g02":
+			raise RuntimeError("active voice removal did not select the available fallback")
+		voice_store.loadVoiceDefinitions = lambda: OrderedDict((
+			("en_GB_g02", fixtureVoice("en_GB_g02")),
+		))
+		driver.refreshAvailableVoices()
+		driver._set_voice("en_GB_l02")
+		if driver._get_voice() != "en_GB_g02" or tuple(driver._get_availableVoices()) != ("en_GB_g02",):
+			raise RuntimeError("removed voice remained selectable or displaced the speaking fallback")
 finally:
 	driver.terminate()

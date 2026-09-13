@@ -12,17 +12,19 @@ FIXTURE = os.environ.get("SAMSUNG_GALAXY_TEST_FIXTURE")
 if not FIXTURE:
 	raise unittest.SkipTest("Proprietary Samsung integration fixture is not configured")
 FIXTURE = Path(FIXTURE)
-HOST = DATA / "runtime" / "samsungGalaxyHost.exe"
+HOST = Path(os.environ.get(
+	"SAMSUNG_GALAXY_TEST_HOST",
+	DATA / "runtime" / "samsungGalaxyHost.exe",
+))
+VOICE = FIXTURE / "voices" / "en-gb-l02"
+VOICE_METADATA = json.loads((VOICE / "voice.json").read_text(encoding="utf-8"))
 ENGINE = Path(os.environ.get(
 	"SAMSUNG_GALAXY_TEST_ENGINE",
-	FIXTURE / "engines" / "regular" / "libsamsungtts.so",
+	FIXTURE / "engines" / VOICE_METADATA["engineHash"] / "libsamsungtts.so",
 ))
-VOICE = Path(os.environ.get(
-	"SAMSUNG_GALAXY_TEST_VOICE",
-	FIXTURE / "voices" / "en-gb-l02",
-))
-FAMILY = os.environ.get("SAMSUNG_GALAXY_TEST_FAMILY", "l")
-SPEAKER = os.environ.get("SAMSUNG_GALAXY_TEST_SPEAKER", "2")
+VOICE = Path(os.environ.get("SAMSUNG_GALAXY_TEST_VOICE", VOICE))
+FAMILY = os.environ.get("SAMSUNG_GALAXY_TEST_FAMILY", str(VOICE_METADATA["family"]))
+SPEAKER = os.environ.get("SAMSUNG_GALAXY_TEST_SPEAKER", str(VOICE_METADATA["speaker"]))
 ANDROID = DATA / "android"
 
 

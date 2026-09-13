@@ -31,6 +31,7 @@ _ANDROID_DIR = os.path.join(_DATA_DIR, "android")
 _MAX_FRAME = 16 << 20
 _FRAME_LENGTH = struct.Struct("<I")
 _PARAMETERS = struct.Struct("<ii")
+_LEGACY_CANCEL_ENGINE_VERSION_MAX = 499_999_999
 
 _VOICE_DEFINITIONS = OrderedDict()
 _AVAILABLE_VOICES = OrderedDict()
@@ -147,8 +148,11 @@ class _SamsungHost:
 		self._writeLock = threading.Lock()
 		self._lifecycleLock = threading.RLock()
 		self._terminalEvent = threading.Event()
+		self._terminalKind = None
 		self._diagnostics = deque(maxlen=20)
 		self.sampleRate = 24000
+		self.engineVersion = 0
+		self.supportsCooperativeCancel = False
 
 	@staticmethod
 	def _readExact(stream, size):
@@ -170,17 +174,21 @@ class _SamsungHost:
 				payload = self._readExact(process.stdout, size) if size else b""
 				if process is not self._process:
 					return
-				if kind in (b"C", b"D", b"E"):
-					self._terminalEvent.set()
 				self._messages.put((kind, payload))
+				if kind in (b"C", b"D", b"E"):
+					# A terminal event promises that its matching frame can be consumed.
+					self._terminalKind = kind
+					self._terminalEvent.set()
 		except EOFError:
 			if process is self._process:
-				self._terminalEvent.set()
 				self._messages.put((None, b"The Samsung helper stopped unexpectedly."))
+				self._terminalKind = None
+				self._terminalEvent.set()
 		except Exception as error:
 			if process is self._process:
-				self._terminalEvent.set()
 				self._messages.put((None, str(error).encode("utf-8", "replace")))
+				self._terminalKind = None
+				self._terminalEvent.set()
 
 	def _stderrReader(self, process):
 		try:
@@ -235,6 +243,7 @@ class _SamsungHost:
 			self._process = process
 			self._voice = voice
 			self._messages = queue.Queue(maxsize=128)
+			self._terminalKind = None
 			self._terminalEvent.clear()
 			self._diagnostics.clear()
 			try:
@@ -256,11 +265,14 @@ class _SamsungHost:
 			try:
 				metadata = json.loads(payload.decode("utf-8"))
 				self.sampleRate = int(metadata["sampleRate"])
+				self.engineVersion = int(metadata["engineVersion"])
 			except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
 				self._stopUnlocked()
 				raise _HostError("The Samsung Galaxy helper returned invalid startup information.") from error
+			self.supportsCooperativeCancel = self.engineVersion <= _LEGACY_CANCEL_ENGINE_VERSION_MAX
 			log.debug(
 				f"Samsung Galaxy Voices: host ready; pid={self.pid}; voice={voice}; "
+				f"engineVersion={self.engineVersion}; cooperativeCancel={self.supportsCooperativeCancel}; "
 				f"startupMs={(time.monotonic() - startedAt) * 1000:.1f}"
 			)
 
@@ -286,7 +298,16 @@ class _SamsungHost:
 	def beginRequest(self):
 		# A terminal frame belongs to the request that follows. Clearing here
 		# prevents stale completion without erasing a completion that races cancel.
+		self._terminalKind = None
 		self._terminalEvent.clear()
+
+	def _releaseConsumer(self):
+		try:
+			while True:
+				self._messages.get_nowait()
+		except queue.Empty:
+			pass
+		self._messages.put_nowait((b"X", b""))
 
 	def requestCancel(self):
 		if self.isRunning():
@@ -296,15 +317,27 @@ class _SamsungHost:
 				pass
 			# Release NVDA's synthesis worker immediately. The terminal event is
 			# tracked separately so recovery can finish without delaying new speech.
+			self._releaseConsumer()
+
+	def abandonRequest(self):
+		"""Release NVDA while allowing an engine with unsafe stop support to finish."""
+		if self.isRunning():
+			self._releaseConsumer()
+
+	def waitForTerminal(self, expectedKind, timeout):
+		deadline = time.monotonic() + timeout
+		while True:
+			if self._terminalEvent.is_set():
+				return self._terminalKind == expectedKind
+			remaining = deadline - time.monotonic()
+			if remaining <= 0:
+				return False
+			# Once NVDA's consumer has exited, drain abandoned audio so the bounded
+			# queue cannot prevent the helper from delivering its terminal frame.
 			try:
-				while True:
-					self._messages.get_nowait()
+				self._messages.get(timeout=min(0.05, remaining))
 			except queue.Empty:
 				pass
-			self._messages.put_nowait((b"X", b""))
-
-	def waitForTerminal(self, timeout):
-		return self._terminalEvent.wait(timeout)
 
 	def prepareReuse(self):
 		try:
@@ -312,6 +345,7 @@ class _SamsungHost:
 				self._messages.get_nowait()
 		except queue.Empty:
 			pass
+		self._terminalKind = None
 		self._terminalEvent.clear()
 
 	def _stopUnlocked(self):
@@ -660,8 +694,26 @@ class SynthDriver(SynthDriver):
 	def _recoverOrRetireHost(self, host, voice):
 		startedAt = time.monotonic()
 		pid = host.pid
-		host.requestCancel()
-		terminal = host.waitForTerminal(5.0)
+		if host.supportsCooperativeCancel:
+			host.requestCancel()
+			expectedTerminal = b"C"
+			terminalTimeout = 5.0
+		else:
+			# Stop presenting the obsolete audio immediately, but do not invoke the
+			# newer Samsung engine's unsafe stop operation. It can finish silently
+			# and the already-warm process can then serve a later request.
+			host.abandonRequest()
+			expectedTerminal = b"D"
+			terminalTimeout = 30.0
+		deadline = time.monotonic() + 1.0
+		while time.monotonic() < deadline:
+			with self._hostLock:
+				if self._synthesizingHost is not host:
+					break
+			time.sleep(0.005)
+		with self._hostLock:
+			consumerReleased = self._synthesizingHost is not host
+		terminal = consumerReleased and host.waitForTerminal(expectedTerminal, terminalTimeout)
 		deadline = time.monotonic() + 0.25
 		while terminal and time.monotonic() < deadline:
 			with self._hostLock:
@@ -673,9 +725,11 @@ class SynthDriver(SynthDriver):
 		assigned = False
 		assignedSlot = None
 		with self._hostAvailable:
+			wasRetiring = host in self._retiringHosts
 			self._retiringHosts.discard(host)
 			if (
 				reusable
+				and wasRetiring
 				and not self._stopping.is_set()
 				and voice == self._voice
 			):
@@ -691,14 +745,15 @@ class SynthDriver(SynthDriver):
 			self._hostAvailable.notify_all()
 		if assigned:
 			log.debug(
-				f"Samsung Galaxy Voices: cancelled host recovered; pid={pid}; slot={assignedSlot}; "
+				f"Samsung Galaxy Voices: interrupted host recovered; pid={pid}; slot={assignedSlot}; "
+				f"terminal={expectedTerminal.decode('ascii')}; "
 				f"elapsedMs={(time.monotonic() - startedAt) * 1000:.1f}"
 			)
 		else:
 			host.abort()
 			log.debug(
 				f"Samsung Galaxy Voices: unresponsive host retired; pid={pid}; "
-				f"terminal={terminal}; reusable={reusable}; "
+				f"terminal={terminal}; expected={expectedTerminal.decode('ascii')}; reusable={reusable}; "
 				f"elapsedMs={(time.monotonic() - startedAt) * 1000:.1f}"
 			)
 			self._ensureStandbyHost(voice)

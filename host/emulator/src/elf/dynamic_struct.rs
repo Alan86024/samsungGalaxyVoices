@@ -321,6 +321,7 @@ fn parse_android_rel(
                 offset: reloc_offset as u64,
                 info: reloc_info,
                 addend: reloc_addend,
+                has_addend: rela,
             });
         }
     }

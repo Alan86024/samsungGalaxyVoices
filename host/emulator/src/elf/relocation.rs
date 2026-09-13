@@ -12,6 +12,7 @@ pub struct ElfRelocation {
     pub(crate) offset: u64,
     pub(crate) info: i64,
     pub(crate) addend: i64,
+    pub(crate) has_addend: bool,
 }
 
 impl ElfRelocation {
@@ -49,6 +50,7 @@ impl ElfRelocation {
             offset,
             info,
             addend,
+            has_addend: entry_size >= 24,
         }
     }
 

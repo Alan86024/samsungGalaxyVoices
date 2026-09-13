@@ -8,13 +8,22 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-HOST = ROOT / "addon" / "synthDrivers" / "_samsungGalaxyVoices" / "runtime" / "samsungGalaxyHost.exe"
+HOST = Path(os.environ.get(
+    "SAMSUNG_GALAXY_TEST_HOST",
+    ROOT / "addon" / "synthDrivers" / "_samsungGalaxyVoices" / "runtime" / "samsungGalaxyHost.exe",
+))
 DATA_ENV = os.environ.get("SAMSUNG_GALAXY_TEST_DATA")
 if not DATA_ENV:
 	raise unittest.SkipTest("Set SAMSUNG_GALAXY_TEST_DATA to an installed Samsung Galaxy Voices data folder")
 DATA = Path(DATA_ENV)
-ENGINE = DATA / "engines" / "regular" / "libsamsungtts.so"
-VOICE = DATA / "voices" / "en-gb-l02"
+VOICE = Path(os.environ.get("SAMSUNG_GALAXY_TEST_VOICE", DATA / "voices" / "en-gb-l02"))
+if os.environ.get("SAMSUNG_GALAXY_TEST_ENGINE"):
+    ENGINE = Path(os.environ["SAMSUNG_GALAXY_TEST_ENGINE"])
+else:
+    VOICE_METADATA = json.loads((VOICE / "voice.json").read_text(encoding="utf-8"))
+    ENGINE = DATA / "engines" / VOICE_METADATA["engineHash"] / "libsamsungtts.so"
+FAMILY = os.environ.get("SAMSUNG_GALAXY_TEST_FAMILY", "l")
+SPEAKER = os.environ.get("SAMSUNG_GALAXY_TEST_SPEAKER", "2")
 ANDROID = ROOT / "addon" / "synthDrivers" / "_samsungGalaxyVoices" / "android"
 REPLACEMENT = "Replacement speech should begin immediately and contain none of the cancelled sentence."
 
@@ -39,7 +48,7 @@ def write_frame(process, kind, payload=b""):
 
 def start_host():
     process = subprocess.Popen(
-        [str(HOST), "--server", str(ENGINE), str(VOICE), str(ANDROID), "l", "2"],
+        [str(HOST), "--server", str(ENGINE), str(VOICE), str(ANDROID), FAMILY, SPEAKER],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=None,
