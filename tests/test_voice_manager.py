@@ -201,6 +201,16 @@ class VoiceStoreTests(unittest.TestCase):
 		definitions = self.store.loadVoiceDefinitions()
 		self.assertEqual("f", definitions["cs_CZ_f00"]["family"])
 
+	def test_verified_compact_language_data_sizes_are_accepted(self):
+		minimum, maximum = self.store.LANGUAGE_DATA_LIMITS
+		self.assertLessEqual(minimum, 786786)  # Finnish compact package.
+		self.assertLessEqual(minimum, 943424)  # Hindi compact package.
+		self.assertGreaterEqual(maximum, 943424)
+
+	def test_invalid_member_size_identifies_the_file_and_size(self):
+		with self.assertRaisesRegex(RuntimeError, r"invalid lng \(123 bytes\)"):
+			self.store._validateMemberSize("lng", 123, self.store.LANGUAGE_DATA_LIMITS)
+
 	def test_removal_collects_unreferenced_engine(self):
 		self.store.installVoice("en_us_l03", lambda received, total: None)
 		engine_path = Path(next(iter(self.store.loadVoiceDefinitions().values()))["enginePath"])

@@ -22,6 +22,53 @@ use emulator::linux::fs::linux_file::LinuxFileIO;
 use emulator::memory::svc_memory::{Arm64Svc, SvcCallResult};
 use emulator::{AndroidEmulator, RegisterARM64, UnicornArg};
 
+const LEGACY_CANCEL_ENGINE_VERSION_MAX: u64 = 499_999_999;
+#[derive(Clone, Copy)]
+struct CancelLayout {
+    synthesizer_offset: u64,
+    stop_requested_offset: u64,
+    audio_port_offset: u64,
+    audio_port_stop_offset: u64,
+}
+
+const LEGACY_CANCEL_LAYOUT: CancelLayout = CancelLayout {
+    synthesizer_offset: 0x2da0,
+    stop_requested_offset: 0x8357f4,
+    audio_port_offset: 0x657b8,
+    audio_port_stop_offset: 0x39,
+};
+
+const S24_CANCEL_LAYOUT: CancelLayout = CancelLayout {
+    synthesizer_offset: 0x2da8,
+    stop_requested_offset: 0x8365d4,
+    audio_port_offset: 0x66598,
+    audio_port_stop_offset: 0x59,
+};
+
+fn request_samsung_stop(
+    emulator: &AndroidEmulator<()>,
+    engine: u64,
+    layout: CancelLayout,
+) -> Result<()> {
+    let synthesizer = emulator.backend.mem_read_u64(engine + layout.synthesizer_offset)?;
+    if synthesizer == 0 {
+        bail!("Samsung synthesizer is unavailable");
+    }
+    emulator.backend.mem_write(
+        synthesizer + layout.stop_requested_offset,
+        &1u32.to_le_bytes(),
+    )?;
+    let audio_port = emulator.backend.mem_read_u64(synthesizer + layout.audio_port_offset)?;
+    if audio_port == 0 {
+        bail!("Samsung audio port is unavailable");
+    }
+    emulator.backend.mem_write(
+        audio_port + layout.audio_port_stop_offset,
+        &[0],
+    )?;
+    Ok(())
+}
+
 struct AudioCallback {
     pcm: Rc<RefCell<Vec<u8>>>,
     produced_bytes: Arc<AtomicUsize>,
@@ -30,6 +77,7 @@ struct AudioCallback {
     cancelled: Arc<AtomicBool>,
     stream: Option<Arc<Mutex<BufWriter<std::io::Stdout>>>>,
     engine: u64,
+    cancel_layout: CancelLayout,
 }
 
 impl Arm64Svc<()> for AudioCallback {
@@ -38,23 +86,7 @@ impl Arm64Svc<()> for AudioCallback {
     fn handle(&self, emulator: &AndroidEmulator<()>) -> SvcCallResult {
         if self.cancel_requested.load(Ordering::Acquire) {
             self.cancelled.store(true, Ordering::Release);
-            let synthesizer = match emulator.backend.mem_read_u64(self.engine + 0x2da0) {
-                Ok(pointer) if pointer != 0 => pointer,
-                Ok(_) => return SvcCallResult::FUCK(anyhow::anyhow!("Samsung synthesizer is unavailable")),
-                Err(error) => return SvcCallResult::FUCK(error),
-            };
-            if let Err(error) = emulator.backend.mem_write(
-                synthesizer + 0x8357f4,
-                &1u32.to_le_bytes(),
-            ) {
-                return SvcCallResult::FUCK(error);
-            }
-            let port = match emulator.backend.mem_read_u64(synthesizer + 0x657b8) {
-                Ok(pointer) if pointer != 0 => pointer,
-                Ok(_) => return SvcCallResult::FUCK(anyhow::anyhow!("Samsung audio port is unavailable")),
-                Err(error) => return SvcCallResult::FUCK(error),
-            };
-            if let Err(error) = emulator.backend.mem_write(port + 0x39, &[0]) {
+            if let Err(error) = request_samsung_stop(emulator, self.engine, self.cancel_layout) {
                 return SvcCallResult::FUCK(error);
             }
             return SvcCallResult::RET(0);
@@ -295,6 +327,11 @@ fn main() -> Result<()> {
         cancelled: cancelled.clone(),
         stream: stream.clone(),
         engine,
+        cancel_layout: if version <= LEGACY_CANCEL_ENGINE_VERSION_MAX {
+            LEGACY_CANCEL_LAYOUT
+        } else {
+            S24_CANCEL_LAYOUT
+        },
     }));
     call(module, &emulator, "TTS_ENGINE_SetAudioCallback", vec![
         UnicornArg::Ptr(engine), UnicornArg::Ptr(callback), UnicornArg::Ptr(0),
@@ -310,7 +347,7 @@ fn main() -> Result<()> {
     if let Some(stream) = stream {
         {
             let mut output = stream.lock().map_err(|_| anyhow::anyhow!("Samsung host output lock was poisoned"))?;
-            let ready = format!("{{\"protocol\":1,\"sampleRate\":{},\"channels\":1,\"sampleWidth\":2,\"engineVersion\":{}}}",
+            let ready = format!("{{\"protocol\":1,\"sampleRate\":{},\"channels\":1,\"sampleWidth\":2,\"engineVersion\":{},\"cooperativeCancel\":true}}",
                 sample_rate.max(24000), version);
             write_frame(&mut *output, b'R', ready.as_bytes())?;
         }

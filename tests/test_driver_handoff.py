@@ -54,6 +54,7 @@ class Player:
 	def __init__(self, *args, **kwargs):
 		self.first_feed = threading.Event()
 		self.bytes = 0
+		self.data = bytearray()
 		self.idle_calls = 0
 		Player.instances.append(self)
 
@@ -61,6 +62,7 @@ class Player:
 		if not isinstance(data, bytes):
 			raise RuntimeError(f"audio must be immutable bytes, got {type(data).__name__}")
 		self.bytes += len(data)
+		self.data.extend(data)
 		if data:
 			self.first_feed.set()
 		if onDone is not None:
@@ -189,6 +191,18 @@ def fixtureVoice(identifier):
 
 initial_voice_id = custom_voice_id if custom_voice_path else "en_GB_l02"
 voice_store.loadVoiceDefinitions = lambda: OrderedDict(((initial_voice_id, fixtureVoice(initial_voice_id)),))
+compactFixture = (Path(fixtureVoice(initial_voice_id)["path"]) / "assets" / "tiny.ivc").is_file()
+
+
+def assertReplacementAudio(reference, replacement, context):
+	if not compactFixture:
+		if replacement != reference:
+			raise RuntimeError(f"{context} contains stale or incorrect speech")
+		return
+	# Compact models vary their timing between otherwise identical renders.
+	ratio = len(replacement) / len(reference) if reference else 0
+	if not replacement or not 0.5 <= ratio <= 1.5:
+		raise RuntimeError(f"{context} has an unexpected duration")
 
 spec = importlib.util.spec_from_file_location("samsungGalaxyVoices", DRIVER)
 module = importlib.util.module_from_spec(spec)
@@ -256,9 +270,55 @@ if events != [
 	raise RuntimeError(f"Say All text was not grouped across indexes: {events!r}")
 
 try:
+	replacementText = "Replacement speech is responsive and correct."
 	for host in (driver._host, driver._standbyHost):
 		host.start(driver._voice)
 	initial_pids = (driver._host._process.pid, driver._standbyHost._process.pid)
+	if custom_generation == "s24":
+		class PolicyHost:
+			def __init__(self, pid):
+				self.pid = pid
+				self.engineVersion = 512_506_251
+
+			def start(self, voice):
+				pass
+
+		recoveringHost = PolicyHost(70001)
+		coldHost = PolicyHost(70002)
+		originalHostFactory = module._SamsungHost
+		with driver._hostAvailable:
+			savedHost = driver._host
+			savedStandbyHost = driver._standbyHost
+			savedRetiringHosts = driver._retiringHosts
+			driver._host = None
+			driver._standbyHost = None
+			driver._retiringHosts = {recoveringHost}
+		module._SamsungHost = lambda: coldHost
+
+		def completeDelayedRecovery():
+			time.sleep(0.6)
+			with driver._hostAvailable:
+				driver._retiringHosts.discard(recoveringHost)
+				if driver._host is None:
+					driver._host = recoveringHost
+				else:
+					driver._standbyHost = recoveringHost
+				driver._hostAvailable.notify_all()
+
+		recoveryThread = threading.Thread(target=completeDelayedRecovery)
+		recoveryThread.start()
+		try:
+			selectedHost = driver._getHost(driver._voice)
+			if selectedHost is not recoveringHost:
+				raise RuntimeError("S24 recovery policy cold-started before a reusable helper returned")
+		finally:
+			recoveryThread.join()
+			module._SamsungHost = originalHostFactory
+			with driver._hostAvailable:
+				driver._host = savedHost
+				driver._standbyHost = savedStandbyHost
+				driver._retiringHosts = savedRetiringHosts
+				driver._hostAvailable.notify_all()
 	synth.synthDoneSpeaking.event.clear()
 	driver.speak(["A completed utterance should leave both warm engines in place."])
 	if not synth.synthDoneSpeaking.event.wait(10):
@@ -280,6 +340,15 @@ try:
 		raise RuntimeError("routine cancellation replaced a warm helper")
 	if not synth.synthDoneSpeaking.event.wait(10):
 		raise RuntimeError("routine replacement did not finish")
+	referencePlayer = Player.instances[-1]
+	referenceOffset = len(referencePlayer.data)
+	synth.synthDoneSpeaking.event.clear()
+	driver.speak([replacementText])
+	if not synth.synthDoneSpeaking.event.wait(10):
+		raise RuntimeError("reference replacement did not finish")
+	referenceAudio = bytes(referencePlayer.data[referenceOffset:])
+	if not referenceAudio:
+		raise RuntimeError("reference replacement produced no audio")
 	Player.instances[-1].first_feed.clear()
 	synth.synthDoneSpeaking.event.clear()
 	driver.speak(["The cancelled sentence must never delay its replacement. " * 3])
@@ -287,7 +356,7 @@ try:
 		raise RuntimeError("initial speech produced no audio")
 	started = time.perf_counter()
 	driver.cancel()
-	driver.speak(["Replacement speech is responsive and correct."])
+	driver.speak([replacementText])
 	replacement = Player.instances[-1]
 	if not replacement.first_feed.wait(5):
 		raise RuntimeError("replacement speech produced no audio")
@@ -297,6 +366,7 @@ try:
 		raise RuntimeError("replacement exceeded the one-second test ceiling")
 	if not synth.synthDoneSpeaking.event.wait(10):
 		raise RuntimeError("replacement did not finish")
+	assertReplacementAudio(referenceAudio, bytes(replacement.data), "replacement audio")
 	deadline = time.monotonic() + 10
 	while driver._standbyHost is None and time.monotonic() < deadline:
 		time.sleep(0.05)
@@ -307,21 +377,60 @@ try:
 	if replacement_pids != set(initial_pids):
 		raise RuntimeError("a short interruption replaced an otherwise reusable warm helper")
 
-	for iteration in range(30):
+	rapidIterations = 30
+	rapidText = (
+		"Amy Green, United Kingdom, female, Galaxy S24 premium voice; status: installed and ready to use."
+		if custom_generation == "s24"
+		else "a"
+	)
+	for iteration in range(rapidIterations):
 		current_player = Player.instances[-1]
 		current_player.first_feed.clear()
-		driver.speak(["a"])
+		driver.speak([rapidText])
 		if not current_player.first_feed.wait(5):
 			raise RuntimeError(f"rapid request {iteration + 1} produced no audio")
+		if custom_generation == "s24":
+			with driver._hostLock:
+				activePid = driver._activeHost.pid
+			if activePid not in initial_pids:
+				raise RuntimeError(
+					f"rapid request {iteration + 1} cold-started helper {activePid}; "
+					f"expected one of {initial_pids}"
+				)
 		driver.cancel()
+	if custom_generation == "s24":
+		for iteration in range(30):
+			deadline = time.monotonic() + 5
+			while time.monotonic() < deadline:
+				with driver._hostLock:
+					if driver._synthesizingHost is None:
+						break
+				time.sleep(0.005)
+			driver.speak([rapidText])
+			deadline = time.monotonic() + 5
+			while time.monotonic() < deadline:
+				with driver._hostLock:
+					activeHost = driver._synthesizingHost
+				if activeHost is not None:
+					break
+				time.sleep(0.005)
+			else:
+				raise RuntimeError(f"pre-audio request {iteration + 1} did not start")
+			if activeHost.pid not in initial_pids:
+				raise RuntimeError(
+					f"pre-audio request {iteration + 1} cold-started helper {activeHost.pid}; "
+					f"expected one of {initial_pids}"
+				)
+			driver.cancel()
 	final_player = Player.instances[-1]
 	final_player.first_feed.clear()
 	synth.synthDoneSpeaking.event.clear()
-	driver.speak(["Final rapid replacement is responsive."])
+	driver.speak([replacementText])
 	if not final_player.first_feed.wait(5):
 		raise RuntimeError("final rapid replacement produced no audio")
 	if not synth.synthDoneSpeaking.event.wait(10):
 		raise RuntimeError("final rapid replacement did not finish")
+	assertReplacementAudio(referenceAudio, bytes(final_player.data), "final rapid replacement audio")
 	deadline = time.monotonic() + 5
 	while (driver._standbyHost is None or driver._retiringHosts) and time.monotonic() < deadline:
 		time.sleep(0.05)

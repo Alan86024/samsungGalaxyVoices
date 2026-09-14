@@ -319,27 +319,28 @@ def _startVoiceDownloads(codes):
 		if installedNames:
 			wx.CallAfter(_refreshActiveSynth)
 		if errors and installedNames:
-			message = _("Installed {installed} voice(s); {failed} failed. Review the status for details.").format(
+			message = _("Installed {installed} voice(s); {failed} failed.").format(
 				installed=len(installedNames), failed=len(errors),
 			)
 		elif errors:
-			message = _("No voices were installed. Review the status for details.")
+			message = _("No voices were installed.")
 		else:
 			message = _("Installed {count} voice(s). They are now available.").format(count=len(installedNames))
-		details = "\n".join(
+		details = "; ".join(
 			_("{voice}: {error}").format(voice=_voiceLabel(code), error=error)
 			for code, error in errors
 		)
+		result = f"{message} {details}" if details else message
 		with _downloadLock:
 			_downloadState.update(
 				busy=False,
 				percent=100 if not errors else _downloadState["percent"],
-				status=f"{message}\n{details}" if details else message,
-				details={"result": f"{message}\n{details}" if details else message},
+				status=result,
+				details={"result": result},
 				activeCode=None,
 				completedSerial=_downloadState["completedSerial"] + 1,
 			)
-		wx.CallAfter(ui.message, message)
+		wx.CallAfter(ui.message, result)
 
 	threading.Thread(target=worker, name="Samsung Galaxy voice downloads", daemon=True).start()
 	return True

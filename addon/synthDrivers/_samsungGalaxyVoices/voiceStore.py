@@ -25,9 +25,12 @@ ENGINES_DIR = os.path.join(DATA_ROOT, "engines")
 SETTINGS_PATH = os.path.join(DATA_ROOT, "settings.json")
 CATALOG_CACHE_PATH = os.path.join(DATA_ROOT, "catalog.json")
 CATALOG_CACHE_MAX_AGE = 24 * 60 * 60
+CFG_LIMITS = (1024, 1024 * 1024)
+# Genuine compact packages can contain language data below 1 MiB.
+LANGUAGE_DATA_LIMITS = (512 * 1024, 128 * 1024 * 1024)
 REQUIRED_ASSETS = {
-	"assets/cfg": (1024, 1024 * 1024),
-	"assets/lng": (1024 * 1024, 128 * 1024 * 1024),
+	"assets/cfg": CFG_LIMITS,
+	"assets/lng": LANGUAGE_DATA_LIMITS,
 }
 MODEL_LIMITS = (1024 * 1024, 256 * 1024 * 1024)
 ENGINE_MEMBER = "lib/arm64-v8a/libsamsungtts.so"
@@ -422,6 +425,12 @@ _maintenanceLock = threading.Lock()
 _maintenanceComplete = False
 
 
+def _validateMemberSize(label, size, limits):
+	if limits[0] <= size <= limits[1]:
+		return
+	raise RuntimeError(f"The Samsung package contains an invalid {label} ({size} bytes).")
+
+
 def _installVoice(key, progress):
 	code, generation = splitVoiceKey(key)
 	metadata = downloadMetadata(key)
@@ -445,8 +454,7 @@ def _installVoice(key, progress):
 					info = package.getinfo(asset)
 				except KeyError as error:
 					raise RuntimeError("The Samsung package does not contain the expected regular voice data.") from error
-				if not limits[0] <= info.file_size <= limits[1]:
-					raise RuntimeError("A voice data file has an invalid size.")
+				_validateMemberSize(os.path.basename(asset), info.file_size, limits)
 				with package.open(info) as source, open(os.path.join(assetsPath, os.path.basename(asset)), "wb") as output:
 					shutil.copyfileobj(source, output, length=1024 * 1024)
 			modelMember = f"assets/{modelName}"
@@ -454,16 +462,14 @@ def _installVoice(key, progress):
 				modelInfo = package.getinfo(modelMember)
 			except KeyError as error:
 				raise RuntimeError("The Samsung package does not contain the expected voice model.") from error
-			if not MODEL_LIMITS[0] <= modelInfo.file_size <= MODEL_LIMITS[1]:
-				raise RuntimeError("A voice model file has an invalid size.")
+			_validateMemberSize(modelName, modelInfo.file_size, MODEL_LIMITS)
 			with package.open(modelInfo) as source, open(os.path.join(assetsPath, modelName), "wb") as output:
 				shutil.copyfileobj(source, output, length=1024 * 1024)
 			try:
 				engineInfo = package.getinfo(ENGINE_MEMBER)
 			except KeyError as error:
 				raise RuntimeError("The Samsung package does not contain its ARM64 speech engine.") from error
-			if not ENGINE_LIMITS[0] <= engineInfo.file_size <= ENGINE_LIMITS[1]:
-				raise RuntimeError("The Samsung speech engine has an invalid size.")
+			_validateMemberSize("ARM64 speech engine", engineInfo.file_size, ENGINE_LIMITS)
 			with package.open(engineInfo) as source, open(engineTemp, "wb") as output:
 				shutil.copyfileobj(source, output, length=1024 * 1024)
 		_validateEngine(engineTemp)

@@ -26,6 +26,18 @@ FAMILY = os.environ.get("SAMSUNG_GALAXY_TEST_FAMILY", "l")
 SPEAKER = os.environ.get("SAMSUNG_GALAXY_TEST_SPEAKER", "2")
 ANDROID = ROOT / "addon" / "synthDrivers" / "_samsungGalaxyVoices" / "android"
 REPLACEMENT = "Replacement speech should begin immediately and contain none of the cancelled sentence."
+COMPACT_VOICE = (VOICE / "assets" / "tiny.ivc").is_file()
+
+
+def assert_replacement(reference, replacement):
+    if not COMPACT_VOICE:
+        if replacement != reference:
+            raise RuntimeError("replacement audio contains stale or incorrect speech")
+        return
+    # Compact models vary their timing between otherwise identical renders.
+    ratio = len(replacement) / len(reference) if reference else 0
+    if not replacement or not 0.5 <= ratio <= 1.5:
+        raise RuntimeError("compact replacement audio has an unexpected duration")
 
 
 def read_exact(stream, size):
@@ -120,14 +132,12 @@ def main(cycles):
                 break
             elapsed_ms = (time.perf_counter() - started) * 1000
             replacement = speak(process, REPLACEMENT)
-            delta = abs(len(replacement) - len(fresh))
             print(
                 f"Cycle {cycle}: cancel {elapsed_ms:.1f} ms; "
                 f"trailing {trailing_frames} frames/{trailing_bytes} bytes; "
-                f"replacement {len(replacement)} bytes; delta {delta}"
+                f"replacement {len(replacement)} bytes"
             )
-            if delta > 4096:
-                raise RuntimeError("replacement audio differs materially from a fresh render")
+            assert_replacement(fresh, replacement)
     finally:
         stop_host(process)
 

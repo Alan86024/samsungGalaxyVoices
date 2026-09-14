@@ -32,6 +32,8 @@ _MAX_FRAME = 16 << 20
 _FRAME_LENGTH = struct.Struct("<I")
 _PARAMETERS = struct.Struct("<ii")
 _LEGACY_CANCEL_ENGINE_VERSION_MAX = 499_999_999
+_LEGACY_HOST_RECOVERY_WAIT_SECONDS = 0.5
+_S24_HOST_RECOVERY_WAIT_SECONDS = 0.8
 
 _VOICE_DEFINITIONS = OrderedDict()
 _AVAILABLE_VOICES = OrderedDict()
@@ -269,7 +271,10 @@ class _SamsungHost:
 			except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
 				self._stopUnlocked()
 				raise _HostError("The Samsung Galaxy helper returned invalid startup information.") from error
-			self.supportsCooperativeCancel = self.engineVersion <= _LEGACY_CANCEL_ENGINE_VERSION_MAX
+			self.supportsCooperativeCancel = bool(metadata.get(
+				"cooperativeCancel",
+				self.engineVersion <= _LEGACY_CANCEL_ENGINE_VERSION_MAX,
+			))
 			log.debug(
 				f"Samsung Galaxy Voices: host ready; pid={self.pid}; voice={voice}; "
 				f"engineVersion={self.engineVersion}; cooperativeCancel={self.supportsCooperativeCancel}; "
@@ -772,7 +777,15 @@ class SynthDriver(SynthDriver):
 			# Rapid navigation can briefly leave both warm helpers unwinding a
 			# cancelled request. Prefer a bounded wait for either one over a cold
 			# emulator startup, which is considerably slower.
-			deadline = time.monotonic() + 0.5
+			recoveryWaitSeconds = (
+				_S24_HOST_RECOVERY_WAIT_SECONDS
+				if any(
+					host.engineVersion > _LEGACY_CANCEL_ENGINE_VERSION_MAX
+					for host in self._retiringHosts
+				)
+				else _LEGACY_HOST_RECOVERY_WAIT_SECONDS
+			)
+			deadline = time.monotonic() + recoveryWaitSeconds
 			while self._host is None and self._retiringHosts and not self._stopping.is_set():
 				remaining = deadline - time.monotonic()
 				if remaining <= 0:
@@ -783,10 +796,14 @@ class SynthDriver(SynthDriver):
 				created = True
 			host = self._host
 		host.start(voice)
-		log.debug(
+		message = (
 			f"Samsung Galaxy Voices: host selected; pid={host.pid}; cold={created}; "
 			f"waitMs={(time.monotonic() - startedAt) * 1000:.1f}"
 		)
+		if created:
+			log.info(message)
+		else:
+			log.debug(message)
 		return host
 
 	def _replacePlayer(self, createReplacement):
