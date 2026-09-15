@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,8 +51,14 @@ class InstallMigrationTests(unittest.TestCase):
 			"id": "en_US_l04", "language": "en_US", "family": "l", "speaker": 4,
 			"name": "Julia", "engineHash": self.dedicated_hash,
 		}), encoding="utf-8")
+		self.oldAddon = types.SimpleNamespace(
+			name="samsungGalaxyVoices",
+			path=str(self.old),
+			isPendingInstall=False,
+			requestRemove=mock.Mock(),
+		)
 		addon_handler = types.ModuleType("addonHandler")
-		addon_handler.getAvailableAddons = lambda: [types.SimpleNamespace(name="samsungGalaxyVoices", path=str(self.old))]
+		addon_handler.getAvailableAddons = lambda: [self.oldAddon]
 		sys.modules["addonHandler"] = addon_handler
 		global_vars = types.ModuleType("globalVars")
 		global_vars.appArgs = types.SimpleNamespace(configPath=str(self.config))
@@ -79,6 +86,29 @@ class InstallMigrationTests(unittest.TestCase):
 		self.assertEqual(self.dedicated_hash, julia["engineHash"])
 		self.assertFalse((voices / "en-us-l03").exists())
 		self.assertFalse((voices / "en-us-l04").exists())
+		self.oldAddon.requestRemove.assert_called_once_with()
+
+	def test_pending_copy_is_not_marked_for_removal(self):
+		pending = types.SimpleNamespace(
+			name="samsungGalaxyVoices",
+			path=str(self.base / "samsungGalaxyVoices.pendingInstall"),
+			isPendingInstall=True,
+			requestRemove=mock.Mock(),
+		)
+		sys.modules["addonHandler"].getAvailableAddons = lambda: [self.oldAddon, pending]
+
+		self.module.onInstall()
+
+		self.oldAddon.requestRemove.assert_called_once_with()
+		pending.requestRemove.assert_not_called()
+
+	def test_failed_migration_does_not_remove_working_addon(self):
+		self.module._migrateVoiceLayout = mock.Mock(side_effect=RuntimeError("migration failed"))
+
+		with self.assertRaisesRegex(RuntimeError, "migration failed"):
+			self.module.onInstall()
+
+		self.oldAddon.requestRemove.assert_not_called()
 
 	def test_public_upgrade_migrates_complete_flat_voices_without_bundled_engine(self):
 		sys.modules["addonHandler"].getAvailableAddons = lambda: []

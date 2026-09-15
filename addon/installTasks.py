@@ -68,10 +68,10 @@ def _embeddedName(cfgPath):
 	return ""
 
 
-def _legacyAddonPath():
+def _existingAddon():
 	for addon in addonHandler.getAvailableAddons():
-		if addon.name == ADDON_NAME and os.path.isdir(addon.path):
-			return addon.path
+		if addon.name == ADDON_NAME and not getattr(addon, "isPendingInstall", False):
+			return addon
 	return None
 
 
@@ -213,13 +213,13 @@ def _existingEnginePath(metadata):
 	return path if os.path.isfile(path) else None
 
 
-def onInstall():
+def _prepareInstall(existingAddon):
 	removedVoices = _removeBlockedVoicePackages()
 	if removedVoices:
 		_garbageCollectEngines()
 		log.info("Samsung Galaxy Voices: removed %d incompatible voice package(s)", removedVoices)
 	migratedVoices = _migrateVoiceLayout()
-	legacyPath = _legacyAddonPath()
+	legacyPath = existingAddon.path if existingAddon and os.path.isdir(existingAddon.path) else None
 	if not legacyPath:
 		if migratedVoices:
 			log.info("Samsung Galaxy Voices: migrated %d voice folder(s) to the generation layout", migratedVoices)
@@ -307,3 +307,10 @@ def onInstall():
 			except OSError:
 				pass
 		raise
+
+
+def onInstall():
+	existingAddon = _existingAddon()
+	_prepareInstall(existingAddon)
+	if existingAddon:
+		existingAddon.requestRemove()
