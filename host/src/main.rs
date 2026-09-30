@@ -19,10 +19,16 @@ use emulator::android::virtual_library::libc::Libc;
 use emulator::linux::file_system::{FileIO, StMode};
 use emulator::linux::fs::ByteArrayFileIO;
 use emulator::linux::fs::linux_file::LinuxFileIO;
-use emulator::memory::svc_memory::{Arm64Svc, SvcCallResult};
+use emulator::memory::svc_memory::{Arm64Svc, SvcCallResult, SvcMemory};
 use emulator::{AndroidEmulator, RegisterARM64, UnicornArg};
 
 const LEGACY_CANCEL_ENGINE_VERSION_MAX: u64 = 499_999_999;
+const NEURAL_STOP_CALLBACK: &str = "_Z28lpctron_is_stopping_callbackPv";
+const NEURAL_STOP_INSTRUCTIONS: [u32; 13] = [
+    0xb4000120, 0xa9bf7bfd, 0x910003fd, 0xf9400008, 0xaa1f03e1,
+    0xf9403d08, 0xd63f0100, 0xa8c17bfd, 0x36000060, 0x2a1f03e0,
+    0xd65f03c0, 0x52800020, 0xd65f03c0,
+];
 #[derive(Clone, Copy)]
 struct CancelLayout {
     synthesizer_offset: u64,
@@ -78,6 +84,81 @@ struct AudioCallback {
     stream: Option<Arc<Mutex<BufWriter<std::io::Stdout>>>>,
     engine: u64,
     cancel_layout: CancelLayout,
+}
+
+struct NeuralStopCallback {
+    original: Vec<u8>,
+    engine: u64,
+    layout: CancelLayout,
+    requested: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Arm64Svc<()> for NeuralStopCallback {
+    fn name(&self) -> &str { "SamsungNeuralStopCallback" }
+
+    fn on_register(&self, svc: &mut SvcMemory<()>, number: u32) -> u64 {
+        let original = svc.allocate(self.original.len(), "SamsungOriginalNeuralStop");
+        original.write_bytes(self.original.clone().into()).expect("original callback write");
+        // Preserve the guest callback unless cancellation was requested. Jump
+        // back into guest code rather than re-entering emulation from a service.
+        let code = emulator::keystone::assemble(&format!(
+            "stp x0, x30, [sp, #-16]!; svc #{number}; cbnz w0, cancelled; \
+             ldp x0, x30, [sp], #16; ldr x16, original; br x16; \
+             cancelled: ldr x30, [sp, #8]; add sp, sp, #16; mov w0, #1; ret; \
+             original: .quad {}", original.addr
+        )).expect("neural stop trampoline assembly");
+        let pointer = svc.allocate(code.len(), self.name());
+        pointer.write_bytes(code.into()).expect("neural stop trampoline write");
+        pointer.addr
+    }
+
+    fn handle(&self, emulator: &AndroidEmulator<()>) -> SvcCallResult {
+        if !self.requested.load(Ordering::Acquire) {
+            return SvcCallResult::RET(0);
+        }
+        self.cancelled.store(true, Ordering::Release);
+        match request_samsung_stop(emulator, self.engine, self.layout) {
+            Ok(()) => SvcCallResult::RET(1),
+            Err(error) => SvcCallResult::FUCK(error),
+        }
+    }
+}
+
+fn neural_stop_code_matches(code: &[u8]) -> bool {
+    code.len() == NEURAL_STOP_INSTRUCTIONS.len() * 4
+        && code.chunks_exact(4).zip(NEURAL_STOP_INSTRUCTIONS)
+            .all(|(actual, expected)| actual == expected.to_le_bytes())
+}
+
+fn install_neural_stop_callback(
+    module: &emulator::linux::module::LinuxModule<()>,
+    emulator: &AndroidEmulator<()>,
+    engine: u64,
+    layout: CancelLayout,
+    requested: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<bool> {
+    let Ok(symbol) = module.find_symbol_by_name(NEURAL_STOP_CALLBACK, false) else {
+        return Ok(false);
+    };
+    let original = emulator.backend.mem_read_as_vec(
+        symbol.address(), NEURAL_STOP_INSTRUCTIONS.len() * 4,
+    )?;
+    if !neural_stop_code_matches(&original) {
+        return Ok(false);
+    }
+    // The complete verified body has only internal PC-relative branches, so
+    // it can be relocated unchanged. Unknown bodies retain audio-based cancel.
+    let replacement = emulator.register_svc(Box::new(NeuralStopCallback {
+        original, engine, layout, requested, cancelled,
+    }));
+    let mut jump = Vec::new();
+    jump.extend_from_slice(&0x58000050u32.to_le_bytes()); // ldr x16, #8
+    jump.extend_from_slice(&0xd61f0200u32.to_le_bytes()); // br x16
+    jump.extend_from_slice(&replacement.to_le_bytes());
+    emulator.backend.mem_write(symbol.address(), &jump)?;
+    Ok(true)
 }
 
 impl Arm64Svc<()> for AudioCallback {
@@ -318,6 +399,15 @@ fn main() -> Result<()> {
         .ok().and_then(|value| value.parse().ok()).unwrap_or(0)));
     let cancel_requested = Arc::new(AtomicBool::new(false));
     let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_layout = if version <= LEGACY_CANCEL_ENGINE_VERSION_MAX {
+        LEGACY_CANCEL_LAYOUT
+    } else {
+        S24_CANCEL_LAYOUT
+    };
+    install_neural_stop_callback(
+        module, &emulator, engine, cancel_layout,
+        cancel_requested.clone(), cancelled.clone(),
+    )?;
     let stream = server_mode.then(|| Arc::new(Mutex::new(BufWriter::new(std::io::stdout()))));
     let callback = emulator.register_svc(Box::new(AudioCallback {
         pcm: pcm.clone(),
@@ -327,11 +417,7 @@ fn main() -> Result<()> {
         cancelled: cancelled.clone(),
         stream: stream.clone(),
         engine,
-        cancel_layout: if version <= LEGACY_CANCEL_ENGINE_VERSION_MAX {
-            LEGACY_CANCEL_LAYOUT
-        } else {
-            S24_CANCEL_LAYOUT
-        },
+        cancel_layout,
     }));
     call(module, &emulator, "TTS_ENGINE_SetAudioCallback", vec![
         UnicornArg::Ptr(engine), UnicornArg::Ptr(callback), UnicornArg::Ptr(0),
@@ -396,7 +482,7 @@ fn main() -> Result<()> {
                     } else {
                         let mut output = stream.lock().map_err(|_| anyhow::anyhow!("Samsung host output lock was poisoned"))?;
                         match result {
-                            Ok(0) if produced_bytes.load(Ordering::Relaxed) > 0 => {
+                            Ok(0) => {
                                 write_frame(&mut *output, b'D', &produced_bytes.load(Ordering::Relaxed).to_le_bytes())?;
                             }
                             Ok(code) => write_frame(&mut *output, b'E',
@@ -472,4 +558,20 @@ fn main() -> Result<()> {
     // RNIDBG currently corrupts the Windows heap while tearing down after
     // successful ARM64 execution. This one-shot proof exits after flushing.
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neural_stop_hook_accepts_only_the_complete_verified_body() {
+        let mut body: Vec<u8> = NEURAL_STOP_INSTRUCTIONS.iter()
+            .flat_map(|instruction| instruction.to_le_bytes()).collect();
+        assert!(neural_stop_code_matches(&body));
+        assert!(!neural_stop_code_matches(&body[..body.len() - 4]));
+        let last = body.len() - 1;
+        body[last] ^= 1;
+        assert!(!neural_stop_code_matches(&body));
+    }
 }

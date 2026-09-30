@@ -34,6 +34,7 @@ _PARAMETERS = struct.Struct("<ii")
 _LEGACY_CANCEL_ENGINE_VERSION_MAX = 499_999_999
 _LEGACY_HOST_RECOVERY_WAIT_SECONDS = 0.5
 _S24_HOST_RECOVERY_WAIT_SECONDS = 0.8
+_MAX_WARM_HOSTS = 2
 
 _VOICE_DEFINITIONS = OrderedDict()
 _AVAILABLE_VOICES = OrderedDict()
@@ -150,8 +151,11 @@ class _SamsungHost:
 		self._writeLock = threading.Lock()
 		self._lifecycleLock = threading.RLock()
 		self._terminalEvent = threading.Event()
+		self._terminalLock = threading.Lock()
 		self._terminalKind = None
 		self._diagnostics = deque(maxlen=20)
+		self._lastFrameAt = None
+		self._lastFrameKind = None
 		self.sampleRate = 24000
 		self.engineVersion = 0
 		self.supportsCooperativeCancel = False
@@ -167,6 +171,7 @@ class _SamsungHost:
 		return bytes(data)
 
 	def _reader(self, process):
+		messages = self._messages
 		try:
 			while process is self._process:
 				kind = self._readExact(process.stdout, 1)
@@ -176,25 +181,30 @@ class _SamsungHost:
 				payload = self._readExact(process.stdout, size) if size else b""
 				if process is not self._process:
 					return
-				self._messages.put((kind, payload))
+				self._lastFrameAt = time.monotonic()
+				self._lastFrameKind = kind
 				if kind in (b"C", b"D", b"E"):
-					# A terminal event promises that its matching frame can be consumed.
+					self._publishTerminal(process, messages, kind, payload)
+				else:
+					messages.put((kind, payload))
+		except EOFError:
+			self._publishTerminal(process, messages, None, b"The Samsung helper stopped unexpectedly.")
+		except Exception as error:
+			self._publishTerminal(process, messages, None, str(error).encode("utf-8", "replace"))
+
+	def _publishTerminal(self, process, messages, kind, payload):
+		# A consumer can remove a queued frame before put() returns. Serialize
+		# publication with consumption so an old completion cannot mark a new request done.
+		with self._terminalLock:
+			if process is self._process:
+				messages.put((kind, payload))
+				if process is self._process:
 					self._terminalKind = kind
 					self._terminalEvent.set()
-		except EOFError:
-			if process is self._process:
-				self._messages.put((None, b"The Samsung helper stopped unexpectedly."))
-				self._terminalKind = None
-				self._terminalEvent.set()
-		except Exception as error:
-			if process is self._process:
-				self._messages.put((None, str(error).encode("utf-8", "replace")))
-				self._terminalKind = None
-				self._terminalEvent.set()
 
 	def _stderrReader(self, process):
 		try:
-			for line in iter(process.stderr.readline, b""):
+			for line in iter(lambda: process.stderr.readline(1024), b""):
 				if process is not self._process:
 					return
 				text = line.decode("utf-8", "replace").strip()
@@ -248,6 +258,7 @@ class _SamsungHost:
 			self._terminalKind = None
 			self._terminalEvent.clear()
 			self._diagnostics.clear()
+			self._lastFrameAt = self._lastFrameKind = None
 			try:
 				self._job = _ProcessJob(process)
 			except Exception:
@@ -296,15 +307,35 @@ class _SamsungHost:
 
 	def getMessage(self, timeout=30):
 		try:
-			return self._messages.get(timeout=timeout)
+			message = self._messages.get(timeout=timeout)
 		except queue.Empty as error:
-			raise _HostError("The Samsung Galaxy speech helper stopped responding.") from error
+			raise _HostError(
+				f"The Samsung Galaxy speech helper stopped responding after {timeout:g}s; "
+				f"{self.diagnosticSummary()}"
+			) from error
+		if message[0] in (b"C", b"D", b"E", None):
+			with self._terminalLock:
+				pass
+		return message
+
+	def diagnosticSummary(self):
+		process = self._process
+		frameAge = (
+			f"{time.monotonic() - self._lastFrameAt:.2f}s"
+			if self._lastFrameAt is not None else "none"
+		)
+		return (
+			f"pid={getattr(process, 'pid', None)}; voice={self._voice}; engineVersion={self.engineVersion}; "
+			f"exitCode={process.poll() if process is not None else 'closed'}; "
+			f"queuedFrames={self._messages.qsize()}; lastFrame={self._lastFrameKind!r}; frameAge={frameAge}"
+		)
 
 	def beginRequest(self):
 		# A terminal frame belongs to the request that follows. Clearing here
 		# prevents stale completion without erasing a completion that races cancel.
-		self._terminalKind = None
-		self._terminalEvent.clear()
+		with self._terminalLock:
+			self._terminalKind = None
+			self._terminalEvent.clear()
 
 	def _releaseConsumer(self):
 		try:
@@ -333,7 +364,12 @@ class _SamsungHost:
 		deadline = time.monotonic() + timeout
 		while True:
 			if self._terminalEvent.is_set():
-				return self._terminalKind == expectedKind
+				# Speech can finish between cancel() and the helper receiving X.
+				# Both successful endings are reusable; the next parameter reply
+				# also orders reuse after the queued stop command.
+				return self._terminalKind == expectedKind or (
+					expectedKind == b"C" and self._terminalKind == b"D"
+				)
 			remaining = deadline - time.monotonic()
 			if remaining <= 0:
 				return False
@@ -345,18 +381,22 @@ class _SamsungHost:
 				pass
 
 	def prepareReuse(self):
-		try:
-			while True:
-				self._messages.get_nowait()
-		except queue.Empty:
-			pass
-		self._terminalKind = None
-		self._terminalEvent.clear()
+		with self._terminalLock:
+			try:
+				while True:
+					self._messages.get_nowait()
+			except queue.Empty:
+				pass
+			self._terminalKind = None
+			self._terminalEvent.clear()
 
 	def _stopUnlocked(self):
 		process = self._process
 		self._process = None
 		self._voice = None
+		if process is not None:
+			# Release a reader blocked by abandoned audio before closing its pipes.
+			self._releaseConsumer()
 		if process is not None and process.poll() is None:
 			try:
 				with self._writeLock:
@@ -394,6 +434,8 @@ class _SamsungHost:
 			process = self._process
 			self._process = None
 			self._voice = None
+			if process is not None:
+				self._releaseConsumer()
 			if process is not None and process.poll() is None:
 				try:
 					process.terminate()
@@ -765,7 +807,15 @@ class SynthDriver(SynthDriver):
 
 	def _warmHost(self, host, voice):
 		try:
+			if self._stopping.is_set():
+				return
 			host.start(voice)
+			with self._hostLock:
+				keepHost = not self._stopping.is_set() and host in (
+					self._host, self._standbyHost, *self._retiringHosts,
+				)
+			if not keepHost:
+				host.abort()
 		except Exception:
 			if not self._stopping.is_set():
 				log.debugWarning("Samsung Galaxy Voices: replacement helper warm-up failed", exc_info=True)
@@ -773,6 +823,7 @@ class SynthDriver(SynthDriver):
 	def _getHost(self, voice):
 		startedAt = time.monotonic()
 		created = False
+		replacedHost = None
 		with self._hostAvailable:
 			# Rapid navigation can briefly leave both warm helpers unwinding a
 			# cancelled request. Prefer a bounded wait for either one over a cold
@@ -792,10 +843,24 @@ class SynthDriver(SynthDriver):
 					break
 				self._hostAvailable.wait(remaining)
 			if self._host is None:
+				# A slow cancellation must not grow the emulator pool on every key.
+				# The single synthesis worker has already released these consumers.
+				if len(self._retiringHosts) >= _MAX_WARM_HOSTS:
+					replacedHost = self._retiringHosts.pop()
 				self._host = _SamsungHost()
 				created = True
 			host = self._host
+		if replacedHost is not None:
+			log.warning(
+				f"Samsung Galaxy Voices: recovery pool full; retiring pid={replacedHost.pid}; voice={voice}"
+			)
+			replacedHost.abort()
+		if self._stopping.is_set():
+			raise _HostError("The Samsung synthesizer is stopping.")
 		host.start(voice)
+		if self._stopping.is_set():
+			host.abort()
+			raise _HostError("The Samsung synthesizer is stopping.")
 		message = (
 			f"Samsung Galaxy Voices: host selected; pid={host.pid}; cold={created}; "
 			f"waitMs={(time.monotonic() - startedAt) * 1000:.1f}"
@@ -875,9 +940,38 @@ class SynthDriver(SynthDriver):
 				if self._isCurrent(job[0]):
 					self._render(*job)
 			except Exception:
-				log.error("Samsung Galaxy Voices synthesis failed", exc_info=True)
+				if self._isCurrent(job[0]):
+					log.error("Samsung Galaxy Voices synthesis failed", exc_info=True)
+					try:
+						with self._playerLock:
+							if self._player is not None and self._isCurrent(job[0]):
+								self._player.stop()
+					except Exception:
+						log.debugWarning("Samsung Galaxy Voices: failed-request audio cleanup failed", exc_info=True)
+					finally:
+						# A failed request must not leave NVDA waiting forever for completion.
+						self._notifyDone(job[0])
+				else:
+					log.debug("Samsung Galaxy Voices: obsolete request ended during cancellation")
 			finally:
 				self._jobs.task_done()
+
+	def _discardFailedHost(self, host, voice, stage):
+		pid = host.pid
+		with self._hostAvailable:
+			if self._host is host:
+				self._host = self._standbyHost
+				self._standbyHost = None
+			elif self._standbyHost is host:
+				self._standbyHost = None
+			self._retiringHosts.discard(host)
+			self._hostAvailable.notify_all()
+		log.warning(
+			f"Samsung Galaxy Voices: failed helper discarded; pid={pid}; voice={voice}; "
+			f"engineVersion={host.engineVersion}; stage={stage}; "
+			f"diagnostics={'; '.join(host._diagnostics)}"
+		)
+		host.abort()
 
 	def _setHostParameters(self, host, rate, pitch):
 		host.send(b"P", _PARAMETERS.pack(self._nativeRate(rate), self._nativeValue(pitch)))
@@ -959,6 +1053,8 @@ class SynthDriver(SynthDriver):
 		voice, rate, pitch, volume = settings
 		host = None
 		completed = False
+		failed = False
+		stage = "startup"
 		try:
 			host = self._getHost(voice)
 			with self._hostLock:
@@ -974,7 +1070,9 @@ class SynthDriver(SynthDriver):
 					synthIndexReached.notify(synth=self, index=value)
 					continue
 				blockPitch = max(0, min(100, pitch + pitchOffset))
+				stage = "parameters"
 				self._setHostParameters(host, rate, blockPitch)
+				stage = "synthesis"
 				if not self._synthesize(host, token, value, volume, player):
 					return
 				if not self._isCurrent(token):
@@ -984,6 +1082,11 @@ class SynthDriver(SynthDriver):
 			if self._isCurrent(token):
 				completed = True
 				player.feed(b"", onDone=lambda: self._notifyDone(token))
+		except Exception:
+			failed = True
+			if host is not None:
+				self._discardFailedHost(host, voice, stage)
+			raise
 		finally:
 			activeDone.set()
 			with self._playerLock:
@@ -993,7 +1096,12 @@ class SynthDriver(SynthDriver):
 			with self._hostLock:
 				if self._activeHost is host:
 					self._activeHost = None
-			if completed:
+				orphaned = host is not None and host not in (
+					self._host, self._standbyHost, *self._retiringHosts,
+				)
+			if orphaned and not failed:
+				host.abort()
+			if completed or failed:
 				self._ensureStandbyHost(voice)
 
 	def _notifyDone(self, token):

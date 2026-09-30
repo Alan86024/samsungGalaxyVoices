@@ -33,10 +33,23 @@
 <h2>Speech Settings</h2>
 <p>Voice, rate, pitch, and volume are available in NVDA's speech settings and synthesizer settings ring. Rate and pitch use Samsung's native controls. Rate 50 is Samsung's normal speed, with a progressively wider range above 50 for fast screen-reader use. Volume is applied through NVDA's audio path. During Say All, adjacent lines without a natural pause are passed to Samsung as one continuous utterance.</p>
 <p>The Samsung Galaxy Voices panel also provides Playback buffering from 0 to 500 milliseconds, adjustable in 25 millisecond steps. Zero is the default and gives the fastest response. If live speech sounds grainy or breaks up on a slower or heavily loaded computer, increase the value in small steps until playback becomes stable. Higher values delay the beginning of each utterance but do not change the generated voice.</p>
+<p>Playback buffering cannot repair a failed speech helper. If a helper fails or stops responding, the add-on discards it so later speech can use a working helper instead. The failed text is not replayed automatically. NVDA's log records the affected voice, engine version, failure stage, and recent helper activity without recording the requested text. These details are useful when reporting a problem.</p>
 
 <h2>Updates</h2>
 <p>The Samsung Galaxy Voices panel contains a Check for add-on updates setting with Never, Hourly, and Daily choices. Daily is the default for new installations. Check Now performs an immediate manual check. Update files and their manifests must pass cryptographic signature, package identity, version, size, and SHA-256 checks before NVDA will install them.</p>
 <p>This schedule controls add-on updates. Voice packages are updated only when the user selects Download or update in the voice manager.</p>
+
+<h2>Changes in 1.1.3</h2>
+<ul>
+<li>Reduced the work needed to cancel interrupted characters in compatible premium engines, helping warm helpers remain available during rapid typing and navigation.</li>
+<li>Fixed failed speech helpers remaining in use after a synthesis or speech-settings timeout, allowing subsequent speech to recover. Addresses the helper failures reported in Issues <a href="https://github.com/OnjLouis/samsungGalaxyVoices/issues/7">7</a> and <a href="https://github.com/OnjLouis/samsungGalaxyVoices/issues/8">8</a>; testing on the affected systems is still needed.</li>
+<li>Fixed a completion-message race during rapid speech requests and interruptions.</li>
+<li>Kept successfully completed helpers available when an interruption arrives at the same moment speech finishes.</li>
+<li>Stopped restarting a working helper when Samsung successfully processes text that produces no spoken audio.</li>
+<li>Limited helper accumulation during slow interruptions and closed obsolete helpers after voice changes or shutdown.</li>
+<li>Stopped failed requests from leaving NVDA waiting indefinitely for speech to finish.</li>
+<li>Added bounded helper diagnostics to NVDA's log to help investigate intermittent failures.</li>
+</ul>
 
 <h2>Changes in 1.1.2</h2>
 <ul>

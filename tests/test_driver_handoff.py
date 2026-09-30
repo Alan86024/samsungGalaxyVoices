@@ -109,6 +109,9 @@ class VoiceInfo:
 
 
 class Log:
+	def __init__(self):
+		self.errors = []
+
 	def _write(self, level, *args):
 		if os.environ.get("SAMSUNG_GALAXY_TEST_TRACE") == "1":
 			print(level, *args)
@@ -120,7 +123,14 @@ class Log:
 		self._write("WARNING", *args)
 
 	def error(self, *args, **kwargs):
+		self.errors.append(args)
 		self._write("ERROR", *args)
+
+	def warning(self, *args, **kwargs):
+		self._write("WARNING", *args)
+
+	def info(self, *args, **kwargs):
+		self._write("INFO", *args)
 
 
 config = types.ModuleType("config")
@@ -176,7 +186,9 @@ def fixtureVoice(identifier):
 			"language": os.environ.get("SAMSUNG_GALAXY_TEST_LANGUAGE", "en_IN"),
 			"generation": custom_generation,
 		}
-	voicePath = fixture_dir / "voices" / identifier.replace("_", "-").lower()
+	voicePath = fixture_dir / "voices" / "legacy" / identifier.replace("_", "-").lower()
+	if not voicePath.is_dir():
+		voicePath = fixture_dir / "voices" / identifier.replace("_", "-").lower()
 	metadata = json.loads((voicePath / "voice.json").read_text(encoding="utf-8"))
 	return {
 		"name": metadata["name"],
@@ -204,9 +216,14 @@ def assertReplacementAudio(reference, replacement, context):
 	if not replacement or not 0.5 <= ratio <= 1.5:
 		raise RuntimeError(f"{context} has an unexpected duration")
 
-spec = importlib.util.spec_from_file_location("samsungGalaxyVoices", DRIVER)
+spec = importlib.util.spec_from_file_location("samsungGalaxyVoices",
+	os.environ.get("SAMSUNG_GALAXY_TEST_DRIVER", DRIVER))
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+if os.environ.get("SAMSUNG_GALAXY_TEST_DRIVER"):
+	module._RUNTIME_DIR = str(data_dir / "runtime")
+	module._HOST_PATH = str(data_dir / "runtime" / "samsungGalaxyHost.exe")
+	module._ANDROID_DIR = str(data_dir / "android")
 if os.environ.get("SAMSUNG_GALAXY_TEST_HOST"):
 	module._HOST_PATH = os.environ["SAMSUNG_GALAXY_TEST_HOST"]
 
@@ -466,6 +483,31 @@ try:
 		raise RuntimeError("pre-audio cancellation churned the warm helper pool")
 	if len(preAudioPids) != 2:
 		raise RuntimeError("pre-audio cancellation did not leave two warm helpers")
+	# Alternating characters exercise the actual typing/cursor workload rather
+	# than repeatedly interrupting the same long sentence.
+	for character in "a1?b2:c3!d4.e5,f6;" * 2:
+		driver.cancel()
+		driver.speak([character])
+		time.sleep(0.025)
+	driver.cancel()
+	mixedPlayer = Player.instances[-1]
+	mixedPlayer.first_feed.clear()
+	synth.synthDoneSpeaking.event.clear()
+	offset = len(mixedPlayer.data)
+	started = time.perf_counter()
+	driver.speak([replacementText])
+	if not mixedPlayer.first_feed.wait(5):
+		raise RuntimeError("mixed-character replacement produced no audio")
+	print(f"mixed-character replacement first audio: {(time.perf_counter() - started) * 1000:.1f} ms")
+	if not synth.synthDoneSpeaking.event.wait(10):
+		raise RuntimeError("mixed-character replacement did not finish")
+	assertReplacementAudio(referenceAudio, bytes(mixedPlayer.data[offset:]), "mixed-character replacement audio")
+	deadline = time.monotonic() + 5
+	while (driver._standbyHost is None or driver._retiringHosts) and time.monotonic() < deadline:
+		time.sleep(0.01)
+	mixedPids = {driver._host.pid, driver._standbyHost.pid}
+	if mixedPids != set(initial_pids):
+		raise RuntimeError(f"mixed-character interruptions replaced warm helpers: {mixedPids}")
 	idleProcesses = (driver._host._process, driver._standbyHost._process)
 	idleBefore = [processCpuSeconds(process) for process in idleProcesses]
 	time.sleep(2)
@@ -473,6 +515,57 @@ try:
 	print(f"two-second idle CPU: {[round(value, 4) for value in idleCpu]}")
 	if any(value > 0.1 for value in idleCpu):
 		raise RuntimeError("an idle Samsung helper continued consuming CPU")
+	if log_handler.log.errors:
+		raise RuntimeError(f"unexpected driver errors: {log_handler.log.errors!r}")
+
+	if os.environ.get("SAMSUNG_GALAXY_TEST_FAULTS") == "1":
+		for failure in ("parameters", "synthesis"):
+			failedHost = driver._host
+			originalSend = failedHost.send
+			originalFeed = Player.feed
+			injected = threading.Event()
+
+			def dropParameters(kind, payload=b""):
+				if kind == b"P" and not injected.is_set():
+					injected.set()
+					return
+				originalSend(kind, payload)
+
+			def killDuringAudio(player, data, onDone=None):
+				if data and not injected.is_set():
+					injected.set()
+					failedHost._process.kill()
+				originalFeed(player, data, onDone)
+
+			if failure == "parameters":
+				failedHost.send = dropParameters
+			else:
+				Player.feed = killDuringAudio
+			try:
+				synth.synthDoneSpeaking.event.clear()
+				driver.speak(["This request exercises recovery after a failed helper. " * 30])
+				if not synth.synthDoneSpeaking.event.wait(8):
+					raise RuntimeError(f"{failure} failure did not release NVDA's speech queue")
+			finally:
+				failedHost.send = originalSend
+				Player.feed = originalFeed
+			if not injected.is_set() or failedHost.isRunning():
+				raise RuntimeError(f"{failure} failure did not discard the broken helper")
+			offset = len(driver._player.data)
+			synth.synthDoneSpeaking.event.clear()
+			driver.speak([replacementText])
+			if not synth.synthDoneSpeaking.event.wait(8):
+				raise RuntimeError(f"speech after {failure} failure did not complete")
+			assertReplacementAudio(referenceAudio, bytes(driver._player.data[offset:]),
+				f"speech after {failure} failure")
+			deadline = time.monotonic() + 5
+			while (driver._standbyHost is None or not driver._standbyHost.isRunning()) and time.monotonic() < deadline:
+				time.sleep(0.01)
+			if driver._standbyHost is None or not driver._standbyHost.isRunning():
+				raise RuntimeError(f"{failure} recovery did not replenish the standby helper")
+			print(f"{failure} failure: discarded; next speech matches reference; standby restored")
+		if len(log_handler.log.errors) != 2:
+			raise RuntimeError(f"expected two injected failures, got {log_handler.log.errors!r}")
 
 	if not custom_voice_path:
 		voice_store.loadVoiceDefinitions = lambda: OrderedDict((
